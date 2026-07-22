@@ -44,11 +44,11 @@ def get_all_market_symbols(mkt_config):
         resp = requests.post(url, json=payload, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
         if resp.status_code == 200:
             return [item["d"][0] for item in resp.json().get("data", [])]
-    except Exception as e:
+    except Exception:
         pass
     return []
-# --- PINE SCRIPT BİREBİR MATEMATİKSEL ENTEGRASYONU ---
 
+# --- PINE SCRIPT BİREBİR MATEMATİKSEL ENTEGRASYONU ---
 def calculate_atr(high, low, close, period=14):
     """Pine Script'teki ta.atr (RMA bazlı True Range) hesaplaması"""
     tr = np.maximum(high[1:] - low[1:], np.abs(high[1:] - close[:-1]))
@@ -66,7 +66,6 @@ def evaluate_golden_zone_pine_mimic(df):
     """
     Pine Script v6 mantığını bar-bar iteratif olarak simüle eden çekirdek motor.
     """
-    # 1. Pine Inputs
     pivotLen = 15
     confirmBars = 5
     zzDevAtr = 1.5
@@ -82,12 +81,10 @@ def evaluate_golden_zone_pine_mimic(df):
     atr = calculate_atr(high, low, close, 14)
     N = len(high)
     
-    # ZigZag Hafızası
     zzP1, zzP0 = np.nan, np.nan
     zzD1 = 0
     zzLow, zzHigh = np.nan, np.nan
     
-    # Zone & Sinyal Hafızası
     aSet, aAlive = False, False
     aHigh, aLow = np.nan, np.nan
     gTop, gBot = np.nan, np.nan
@@ -97,7 +94,6 @@ def evaluate_golden_zone_pine_mimic(df):
     signal_triggered = False
     signal_type = ""
     
-    # Minimum bar sayısı kontrolü
     if N < pivotLen + confirmBars:
         return None
         
@@ -106,7 +102,6 @@ def evaluate_golden_zone_pine_mimic(df):
         isZigZagLow = False
         zzLegEvent = False
         
-        # O anki barın geçmişe dönük pivot kontrolü (ta.pivothigh/low mantığı)
         idx_eval = i - confirmBars
         window_high = high[idx_eval - pivotLen : i + 1]
         window_low = low[idx_eval - pivotLen : i + 1]
@@ -119,7 +114,6 @@ def evaluate_golden_zone_pine_mimic(df):
         if low[idx_eval] == np.min(window_low):
             usePL = low[idx_eval]
             
-        # Hem tepe hem dip aynı anda gelirse mesafeye göre Pine içindeki ayıklama mantığı
         if not np.isnan(usePH) and not np.isnan(usePL):
             if np.isnan(zzP1):
                 usePH = np.nan; usePL = np.nan
@@ -130,11 +124,9 @@ def evaluate_golden_zone_pine_mimic(df):
                 elif dL > dH: usePH = np.nan
                 else: usePH = np.nan; usePL = np.nan
         
-        # ATR Tabanlı Filtreleme
         pivotAtr = atr[idx_eval] if not np.isnan(atr[idx_eval]) else 0
         zzMinLeg = zzDevAtr * pivotAtr
         
-        # Tepe (High) İşleme
         if not np.isnan(usePH):
             if zzD1 == 1:
                 if usePH > zzP1:
@@ -146,7 +138,6 @@ def evaluate_golden_zone_pine_mimic(df):
                 zzP0 = zzP1; zzP1 = usePH; zzD1 = 1; zzHigh = usePH
                 zzLegEvent = True; isZigZagHigh = True
                 
-        # Dip (Low) İşleme
         if not np.isnan(usePL):
             if zzD1 == -1:
                 if usePL < zzP1:
@@ -158,11 +149,9 @@ def evaluate_golden_zone_pine_mimic(df):
                 zzP0 = zzP1; zzP1 = usePL; zzD1 = -1; zzLow = usePL
                 zzLegEvent = True; isZigZagLow = True
                 
-        # Trailing Stop Güncellemesi
         if isZigZagLow and not np.isnan(zzLow):
             trailingStop = zzLow - (invBufAtr * atr[i])
             
-        # Zone Validasyonları (Sadece Yükseliş - Bullish Setup)
         validLeg = (zzD1 != 0) and not np.isnan(zzP0) and not np.isnan(zzP1) and (zzP0 != zzP1)
         dirBull = (zzD1 == 1)
         legHigh = max(zzP0, zzP1) if validLeg else np.nan
@@ -171,7 +160,6 @@ def evaluate_golden_zone_pine_mimic(df):
         validSetup = validLeg and (legHigh > legLow)
         candidateEvent = zzLegEvent and validSetup
         
-        # Yeni bir bacak (leg) onaylandığında Golden Zone'u hafızaya yaz
         if candidateEvent:
             aSet = True; aAlive = True
             aHigh = legHigh; aLow = legLow
@@ -184,10 +172,8 @@ def evaluate_golden_zone_pine_mimic(df):
         activeValid = aSet and aAlive and not np.isnan(aHigh) and not np.isnan(aLow) and (aHigh - aLow) > 0
         evBullRej = False
         
-        # Mum Kapanışında Sinyal / Rejection (Ret) Kontrolü
         if activeValid and dirBull:
             touchWick = (low[i] <= gTop)
-            # Fiyat Wick ile bölgeye değip, kapanışı bölgenin üzerinde ve pozitif yapmalı
             bullRejectRaw = touchWick and (close[i] > gTop) and (close[i] > open_[i])
             
             if bullRejectRaw and not aRejected:
@@ -196,14 +182,12 @@ def evaluate_golden_zone_pine_mimic(df):
                 
         longEnter = (evBullRej or isZigZagLow) and activeValid and dirBull
         
-        # SADECE TARAMA ANINDAKİ (SON BAR) SİNYALİ YAKALA
         if i == N - 1:
             if longEnter:
                 signal_triggered = True
                 signal_type = "Altın Bölge (Golden Zone) Temas & Red" if evBullRej else "ZigZag Yeni Dip Onayı"
 
     if signal_triggered:
-        # Pine Projection Fiyatı: m = 1.618
         tp_1618 = aHigh + (aHigh - aLow) * 0.618
         return {
             "signal": True,
@@ -222,7 +206,7 @@ def analyze_ticker(symbol, mkt_config, interval):
     yf_ticker = f"{clean_symbol}{mkt_config['yf_suffix']}"
     
     try:
-        period = "3mo" if interval in ["1h", "90m"] else "2y" # Geçmiş barlar için period genişletildi
+        period = "3mo" if interval in ["1h", "90m"] else "2y"
         df = yf.download(tickers=yf_ticker, period=period, interval=interval, progress=False, show_errors=False)
         
         if df.empty or len(df) < 50:
@@ -241,11 +225,12 @@ def analyze_ticker(symbol, mkt_config, interval):
         pass
     return None
 
+# --- GÖRSELLEŞTİRME ---
 def plot_setup(result):
     df = result["df"]
     ticker = result["ticker"]
     
-    plot_df = df.iloc[-100:].copy() # Çizim için son 100 bar
+    plot_df = df.iloc[-100:].copy()
     plot_df.reset_index(inplace=True)
     
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -254,8 +239,6 @@ def plot_setup(result):
     
     ax.axhspan(result["gz_lower"], result["gz_upper"], color='#388E3C', alpha=0.3, label='Golden Zone (0.5 - 0.618)')
     ax.axhline(result["tp"], color='#FFD600', linestyle='--', linewidth=1.5, label='Kâr Al Hedefi (1.618)')
-    
-    # ATR İzleyen Stop Çizgisi (Yeni Eklendi)
     ax.axhline(result["stop_loss"], color='#D32F2F', linestyle=':', linewidth=2, label='ATR İzleyen Stop (Trailing)')
     
     ax.set_title(f"{ticker} - Sinyal: {result['signal_type']}", color='white', fontsize=14, fontweight='bold')
@@ -270,8 +253,6 @@ def plot_setup(result):
         spine.set_color('#333333')
         
     return fig
-
-
 
 # --- ARAYÜZ (UI) ---
 st.title("📊 Tam Kapsamlı Golden Zone Tarayıcı")
@@ -346,10 +327,11 @@ with col2:
                     with col_info:
                         st.markdown(f"**Sembol:** {ticker}")
                         st.markdown(f"**Giriş Bandı:** {res['gz_lower']:.2f} - {res['gz_upper']:.2f}")
-                        st.markdown(f"**Stop (Son Dip):** {res['last_low']:.2f}")
+                        st.markdown(f"**Stop (ATR):** {res['stop_loss']:.2f}")
+                        st.markdown(f"**Sinyal:** {res['signal_type']}")
                         st.markdown(f"[📊 TradingView'da Aç]({tv_link})")
                         
                     with col_chart:
                         fig = plot_setup(res)
                         st.pyplot(fig)
-                        plt.close(fig) 
+                        plt.close(fig)
