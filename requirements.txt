@@ -6,3 +6,4 @@ matplotlib
 seaborn
 yahoo_fin
 requests
+requests_html
