@@ -1,8 +1,10 @@
+
+
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
+import matplotlib.subplots as plt_subplots
 import matplotlib.dates as mdates
 import seaborn as sns
 import requests
@@ -70,21 +72,20 @@ def get_all_market_symbols(mkt_config):
 
 @st.cache_data(ttl=900, show_spinner=False) 
 def fetch_data_cached(tickers, period, interval):
-    return yf.download(tickers=tickers, period=period, interval=interval, group_by="ticker", threads=True, progress=False, show_errors=False)
+    return yf.download(tickers=tickers, period=period, interval=interval, group_by="ticker", threads=True, progress=False)
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_single_historical_data(ticker, interval, start_date, end_date):
-    return yf.download(ticker, start=start_date, end=end_date, interval=interval, progress=False, show_errors=False)
+    return yf.download(ticker, start=start_date, end=end_date, interval=interval, progress=False)
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_first_available_date(ticker, interval):
     """Seçilen hissenin API'deki en eski verisini otomatik olarak bulur."""
     try:
-        # Eğer saatlik veriyse, yfinance limiti gereği en fazla 729 gün geriye gidebiliriz.
         if interval == "1h":
             return datetime.today().date() - timedelta(days=725)
             
-        hist = yf.download(ticker, period="max", interval="1d", progress=False, show_errors=False)
+        hist = yf.download(ticker, period="max", interval="1d", progress=False)
         if not hist.empty:
             return hist.index.min().date()
     except Exception:
@@ -95,10 +96,6 @@ def get_first_available_date(ticker, interval):
 # 4. KANTİTATİF ALGORİTMA: STATE MACHINE (PINE SCRIPT BİREBİR)
 # =============================================================================
 def core_pine_state_machine(df):
-    """
-    Kusursuz Ret (evBullRej) ve Trend Dip (isZigZagLow) mantıklarını 
-    Pine Script (v6) yapısıyla %100 eşzamanlı çalıştıran çekirdek.
-    """
     pivotLen, confirmBars, zzDevAtr, invBufAtr = 15, 5, 1.5, 0.3
     goldenLower, goldenUpper = 0.5, 0.618
     
@@ -106,7 +103,6 @@ def core_pine_state_machine(df):
     closes, opens = df['Close'].values, df['Open'].values
     dates = df.index
     
-    # ATR (RMA) Hesaplaması
     tr = np.maximum(highs[1:] - lows[1:], np.abs(highs[1:] - closes[:-1]))
     tr = np.maximum(tr, np.abs(lows[1:] - closes[:-1]))
     tr = np.insert(tr, 0, highs[0] - lows[0])
@@ -173,12 +169,10 @@ def core_pine_state_machine(df):
         activeValid = aSet and aAlive and not np.isnan(aHigh) and not np.isnan(aLow) and (aHigh - aLow) > 0
         evBullRej = False
         
-        # SADECE Bullish bacaklarda Kusursuz Ret onayı
         if activeValid and aBull:
             if (lows[i] <= gTop) and (closes[i] > gTop) and (closes[i] > opens[i]) and not aRejected:
                 aRejected = True; evBullRej = True
                 
-        # PINE SCRIPT TAM EŞLEŞME: Ret yediğinde VEYA Dip onaylandığında (Trend/Dip)
         longEnter = evBullRej or isZigZagLow
         longExit = (not np.isnan(trailing_stop)) and (closes[i] < trailing_stop)
         
@@ -217,7 +211,6 @@ def core_pine_state_machine(df):
                     }
                 }
                 
-    # Nakitteysek Pusu/Yaklaşma Kontrolü (Son bar)
     if not latest_state["signal"] and activeValid and aBull and not in_position:
         curr_close = closes[-1]
         dist_pct = (curr_close - gTop) / gTop
@@ -469,5 +462,6 @@ with tab_backtest:
                         def highlight_pnl(val):
                             return f"color: {'#10b981' if val > 0 else '#ef4444'}; font-weight: bold;"
                             
+                        st.dataframe(trades_df.style.map(highlight_pnl, subset=['Kâr/Zarar (%)']), use_container_width=True, hide_index=True)
                         st.dataframe(trades_df.style.map(highlight_pnl, subset=['Kâr/Zarar (%)']), use_container_width=True, hide_index=True)
                         st.dataframe(trades_df.style.map(highlight_pnl, subset=['Kâr/Zarar (%)']), use_container_width=True, hide_index=True)
