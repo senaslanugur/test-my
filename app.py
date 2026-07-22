@@ -73,66 +73,113 @@ def fetch_data_cached(tickers, period, interval):
     return yf.download(tickers=tickers, period=period, interval=interval, group_by="ticker", threads=True, progress=False)
 
 # =============================================================================
-# 4. KANTİTATİF ALGORİTMA: GOLDEN ZONE VEKTÖR MOTORU
+# 4. KANTİTATİF ALGORİTMA: HİBRİT PINE SCRIPT MİMARİSİ
 # =============================================================================
-def evaluate_golden_zone(df):
-    highs, lows, closes, opens = df['High'].values, df['Low'].values, df['Close'].values, df['Open'].values
+def evaluate_golden_zone(df, signal_window=5):
+    highs = df['High'].values
+    lows = df['Low'].values
+    closes = df['Close'].values
+    opens = df['Open'].values
     
+    # Pine Script ATR Hesaplaması (Gürültü Filtresi İçin)
+    tr = np.maximum(highs[1:] - lows[1:], np.abs(highs[1:] - closes[:-1]))
+    tr = np.maximum(tr, np.abs(lows[1:] - closes[:-1]))
+    tr = np.insert(tr, 0, highs[0] - lows[0])
+    
+    atr = np.zeros_like(tr)
+    atr[0] = tr[0]
+    for i in range(1, len(tr)):
+        atr[i] = (1/14) * tr[i] + (1 - 1/14) * atr[i-1]
+
     pivots = []
-    # 15 bar geriye, 5 bar ileriye bakarak mutlak tepe ve dipleri bulur
+    # Pivot Tespiti (15 bar geriye, 5 bar ileriye)
     for i in range(15, len(df) - 5):
-        if highs[i] == np.max(highs[i-15 : i+6]): pivots.append((i, 'H', highs[i]))
-        if lows[i] == np.min(lows[i-15 : i+6]): pivots.append((i, 'L', lows[i]))
+        if highs[i] == np.max(highs[i-15 : i+6]):
+            pivots.append({'idx': i, 'type': 'H', 'val': highs[i], 'conf_idx': i + 5})
+        if lows[i] == np.min(lows[i-15 : i+6]):
+            pivots.append({'idx': i, 'type': 'L', 'val': lows[i], 'conf_idx': i + 5})
             
-    if len(pivots) < 2: return False, None
+    if len(pivots) < 2: 
+        return False, None
         
+    # ZigZag Filtrelemesi
     zz = [pivots[0]]
     for p in pivots[1:]:
         last_p = zz[-1]
-        if p[1] == last_p[1]:
-            if p[1] == 'H' and p[2] > last_p[2]: zz[-1] = p
-            elif p[1] == 'L' and p[2] < last_p[2]: zz[-1] = p
-        else: zz.append(p)
+        if p['type'] == last_p['type']:
+            if p['type'] == 'H' and p['val'] > last_p['val']: zz[-1] = p
+            elif p['type'] == 'L' and p['val'] < last_p['val']: zz[-1] = p
+        else:
+            zz.append(p)
             
-    if len(zz) < 2: return False, None
+    if len(zz) < 2: 
+        return False, None
         
-    last_pivot, prev_pivot = zz[-1], zz[-2]
+    last_pivot = zz[-1]
+    prev_pivot = zz[-2]
     
-    # Trend şartı: Son pivot bir tepe olmalıdır
-    if last_pivot[1] != 'H': return False, None
+    # Golden Zone Kurulumu (Son bacak yükseliş olmalı veya son oluşan pivot dip olmalı)
+    if last_pivot['type'] == 'H':
+        leg_high = last_pivot['val']
+        leg_low = prev_pivot['val']
+    else:
+        leg_high = prev_pivot['val']
+        leg_low = last_pivot['val']
         
-    leg_high, leg_low = last_pivot[2], prev_pivot[2]
-    if leg_high <= leg_low: return False, None
+    if leg_high <= leg_low: 
+        return False, None
         
     rng = leg_high - leg_low
     gz_upper = leg_high - (0.5 * rng)
     gz_lower = leg_high - (0.618 * rng)
     
-    pullback_bars = df.iloc[last_pivot[0] + 1 : ]
-    if pullback_bars.empty: return False, None
-        
-    touched_zone = pullback_bars['Low'].min() <= gz_upper
-    curr_close, curr_low, curr_open = closes[-1], lows[-1], opens[-1]
+    curr_close = closes[-1]
+    curr_low = lows[-1]
+    curr_open = opens[-1]
     
     signal = False
     signal_type = ""
     dist_pct = (curr_close - gz_upper) / gz_upper
     
-    # Pine Script Sinyal Kuralları
-    if curr_low <= gz_upper and curr_close > gz_upper and curr_close > curr_open:
-        signal, signal_type = True, "🎯 Kusursuz Ret (Tam Alım)"
-    elif gz_lower <= curr_close <= gz_upper:
-        signal, signal_type = True, "⏳ Pusu Modu (Bölge İçi Bekleyiş)"
-    elif touched_zone and curr_close > gz_upper and curr_close > curr_open:
-        signal, signal_type = True, "🚀 Bölgeden Onaylı Çıkış"
-    elif 0 < dist_pct <= 0.025:
-        signal, signal_type = True, f"👀 Yaklaşıyor (+%{dist_pct*100:.1f})"
+    # SİNYAL 1: PINE SCRIPT "AL (TREND/DİP)" TEYİT YAKALAYICI
+    current_bar_idx = len(df) - 1
+    
+    if last_pivot['type'] == 'L':
+        # Dibin onaylanma barı (conf_idx), son 'signal_window' içine düşüyorsa
+        if (current_bar_idx - signal_window) <= last_pivot['conf_idx'] <= current_bar_idx:
+            # ATR Filtresi
+            min_leg_required = 1.5 * atr[last_pivot['conf_idx']]
+            bounce_distance = closes[last_pivot['conf_idx']] - last_pivot['val']
+            
+            if bounce_distance >= min_leg_required:
+                signal = True
+                signal_type = "🔥 Al (Trend/Dip) Onayı Geldi!"
+    
+    # SİNYAL 2: Kusursuz Ret
+    if not signal and (curr_low <= gz_upper and curr_close > gz_upper and curr_close > curr_open):
+        signal = True
+        signal_type = "🎯 Kusursuz Ret (Tam Alım)"
+        
+    # SİNYAL 3: Pusu Modu
+    elif not signal and (gz_lower <= curr_close <= gz_upper):
+        signal = True
+        signal_type = "⏳ Pusu Modu (Bölge İçi Bekleyiş)"
+        
+    # SİNYAL 4: Yaklaşanlar
+    elif not signal and (0 < dist_pct <= 0.025):
+        signal = True
+        signal_type = f"👀 Yaklaşıyor (+%{dist_pct*100:.1f})"
         
     if signal:
         return True, {
-            "type": signal_type, "gz_lower": gz_lower, "gz_upper": gz_upper,
-            "tp": leg_high + (rng * 0.618), "last_high": leg_high, "stop": leg_low * 0.99
+            "type": signal_type, 
+            "gz_lower": gz_lower, 
+            "gz_upper": gz_upper,
+            "tp": leg_high + (rng * 0.618), 
+            "last_high": leg_high, 
+            "stop": leg_low * 0.99
         }
+        
     return False, None
 
 # =============================================================================
@@ -163,7 +210,6 @@ def draw_gz_chart(symbol, df, ctx):
     ax.legend(loc='upper left', frameon=False, labelcolor='white')
     ax.grid(True, alpha=0.1)
     
-    # X Ekseninde saatleri ve günleri düzgün gösterme
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
     fig.autofmt_xdate()
     plt.tight_layout()
@@ -249,7 +295,6 @@ if execute_scan:
                 console_placeholder.code("\n".join(live_logs[-15:]))
                 
                 curr_price = float(df_symbol['Close'].iloc[-1])
-                # TradingView yönlendirmesi için timeframe eklemesi
                 tv_interval_map = {"1h": "60", "2h": "120", "4h": "240", "1d": "D", "1wk": "W"}
                 tv_interval = tv_interval_map.get(tf_config["resample_rule"] or tf_config["interval"], "D")
                 tv_url = f"https://www.tradingview.com/chart/?symbol={mkt_config['tv_prefix']}{symbol}&interval={tv_interval}"
