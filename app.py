@@ -2,7 +2,7 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import matplotlib.subplots as plt_subplots
+import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import seaborn as sns
 import requests
@@ -211,8 +211,8 @@ def core_pine_state_machine(df):
 # =============================================================================
 def draw_gz_chart(symbol, df, ctx):
     plot_df = df.tail(100).copy()
-    plt_subplots.style.use('dark_background')
-    fig, ax = plt_subplots.subplots(figsize=(12, 6))
+    plt.style.use('dark_background')
+    fig, ax = plt.subplots(figsize=(12, 6))
     
     up, down = plot_df['Close'] >= plot_df['Open'], plot_df['Close'] < plot_df['Open']
     ax.bar(plot_df.index[up], plot_df['Close'][up] - plot_df['Open'][up], 0.6, bottom=plot_df['Open'][up], color='#10b981')
@@ -229,12 +229,12 @@ def draw_gz_chart(symbol, df, ctx):
     ax.grid(True, alpha=0.1)
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
     fig.autofmt_xdate()
-    plt_subplots.tight_layout()
+    plt.tight_layout()
     return fig
 
 def draw_equity_curve(trades_df):
-    plt_subplots.style.use('dark_background')
-    fig, ax = plt_subplots.subplots(figsize=(14, 5))
+    plt.style.use('dark_background')
+    fig, ax = plt.subplots(figsize=(14, 5))
     
     trades_df['Kümülatif Getiri (%)'] = trades_df['Kâr/Zarar (%)'].cumsum()
     
@@ -251,7 +251,7 @@ def draw_equity_curve(trades_df):
     ax.grid(True, alpha=0.1)
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
     fig.autofmt_xdate()
-    plt_subplots.tight_layout()
+    plt.tight_layout()
     return fig
 
 # =============================================================================
@@ -367,13 +367,11 @@ with tab_backtest:
     
     with col_mkt_bt: selected_mkt_bt = st.selectbox("Piyasa Seçin:", list(MARKET_CONFIGS.keys()), key="mkt_bt")
     
-    # Dinamik hisse listesi çekimi (Arama kolaylığı için)
     mkt_config_bt = MARKET_CONFIGS[selected_mkt_bt]
     bt_symbols = get_all_market_symbols(mkt_config_bt)
     
     with col_symbol_bt: 
         if bt_symbols:
-            # Dropdown search (Autocomplete)
             target_symbol = st.selectbox("Hisse Sembolü Ara/Seç:", bt_symbols, key="sym_bt")
         else:
             target_symbol = st.text_input("Hisse Sembolü (Örn: THYAO, AAPL)", "THYAO", key="sym_bt_manual")
@@ -394,7 +392,6 @@ with tab_backtest:
         yf_ticker_bt = f"{target_symbol.replace('.', '-')}{mkt_config_bt['yf_suffix']}"
         
         with st.spinner(f"{target_symbol} için veriler indiriliyor ve simülasyon çalıştırılıyor..."):
-            # Tarihli veri çekimi
             df_bt = fetch_single_historical_data(yf_ticker_bt, tf_config_bt["interval"], start_date, end_date)
             
             if df_bt.empty:
@@ -403,7 +400,6 @@ with tab_backtest:
                 if isinstance(df_bt.columns, pd.MultiIndex):
                     df_bt.columns = df_bt.columns.get_level_values(0)
                     
-                # Sentetik Mum (Resampling)
                 if tf_config_bt["resample_rule"]:
                     try:
                         df_bt.index = pd.to_datetime(df_bt.index)
@@ -423,7 +419,6 @@ with tab_backtest:
                     else:
                         trades_df = pd.DataFrame(trades)
                         
-                        # İstatistiksel Hesaplamalar
                         total_trades = len(trades_df)
                         winning_trades = len(trades_df[trades_df['Kâr/Zarar (%)'] > 0])
                         losing_trades = len(trades_df[trades_df['Kâr/Zarar (%)'] <= 0])
@@ -438,7 +433,6 @@ with tab_backtest:
                             dd = running_max - val
                             if dd > max_drawdown: max_drawdown = dd
                             
-                        # Metrik Kartları (Dashboard)
                         st.write("---")
                         c1, c2, c3, c4 = st.columns(4)
                         with c1: st.markdown(f"<div class='metric-card'><div class='metric-label'>Toplam İşlem</div><div class='metric-value'>{total_trades}</div></div>", unsafe_allow_html=True)
@@ -446,11 +440,9 @@ with tab_backtest:
                         with c3: st.markdown(f"<div class='metric-card'><div class='metric-label'>Kümülatif Net Getiri</div><div class='metric-value' style='color:{'#10b981' if cumulative_return>=0 else '#ef4444'};'>%{cumulative_return:.2f}</div></div>", unsafe_allow_html=True)
                         with c4: st.markdown(f"<div class='metric-card'><div class='metric-label'>Maksimum Düşüş (Max DD)</div><div class='metric-value' style='color:#ef4444;'>-%{max_drawdown:.2f}</div></div>", unsafe_allow_html=True)
                         
-                        # Kümülatif Getiri Grafiği
                         st.write("##")
                         st.pyplot(draw_equity_curve(trades_df))
                         
-                        # İşlem Dökümü Tablosu
                         st.write("### 📝 Detaylı İşlem Dökümü (Trade Log)")
                         
                         def highlight_pnl(val):
