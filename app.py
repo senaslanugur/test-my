@@ -4,8 +4,11 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
+import warnings
+
+# Yfinance hatalarını terminalde gizle
+warnings.filterwarnings("ignore")
 
 # ==========================================
 # 1. SAYFA VE ARAYÜZ KONFİGÜRASYONU
@@ -20,8 +23,6 @@ MARKET_CONFIGS = {
 
 TIMEFRAME_MAP = {
     "1 Saat": "1h",
-    "2 Saat": "1h", 
-    "4 Saat": "1d", 
     "1 Gün": "1d",
     "1 Hafta": "1wk"
 }
@@ -40,7 +41,7 @@ def get_all_market_symbols(mkt_config):
         "symbols": {"query": {"types": []}, "tickers": []},
         "columns": ["name", "volume"],
         "sort": {"sortBy": "volume", "sortOrder": "desc"}, 
-        "range": [0, 800] 
+        "range": [0, 400] # API ban yememek için en hacimli 400 hisse
     }
     try:
         resp = requests.post(url, json=payload, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
@@ -55,8 +56,8 @@ def get_all_market_symbols(mkt_config):
 # ==========================================
 def find_golden_zone_vectorized(df):
     """
-    Kırılgan döngüler yerine, istatistiksel Swing High/Low noktalarını 
-    vektörel olarak bulan ve Golden Zone'u hesaplayan sağlam mimari.
+    İstatistiksel Swing High/Low noktalarını vektörel olarak bulan 
+    ve Golden Zone'u (Yaklaşanlar dahil) hesaplayan mimari.
     """
     highs = df['High'].values
     lows = df['Low'].values
@@ -74,7 +75,6 @@ def find_golden_zone_vectorized(df):
     if len(pivots) < 2: 
         return None
         
-    # Arka arkaya gelen aynı yönlü tepe/dipleri filtrele (ZigZag sadeliği)
     zz = [pivots[0]]
     for p in pivots[1:]:
         last_p = zz[-1]
@@ -105,7 +105,6 @@ def find_golden_zone_vectorized(df):
     gz_upper = leg_high - (0.5 * rng)
     gz_lower = leg_high - (0.618 * rng)
     
-    # Son tepe oluştuktan sonraki fiyat hareketleri (Geri Çekilme Evresi)
     pullback_bars = df.iloc[last_pivot[0] + 1 : ]
     if pullback_bars.empty: 
         return None
@@ -119,24 +118,31 @@ def find_golden_zone_vectorized(df):
     signal = False
     signal_type = ""
     
-    # SİNYAL 1: Kusursuz Pine Script Ret İşlemi (Fitil atıp üstünde kapattı)
+    # Yaklaşma Mesafesi Hesaplama (Golden Zone'un yüzde kaç üzerinde?)
+    distance_to_zone_pct = (curr_close - gz_upper) / gz_upper
+    
+    # SİNYAL 1: Kusursuz Pine Script Ret İşlemi
     if curr_low <= gz_upper and curr_close > gz_upper and curr_close > curr_open:
         signal = True
-        signal_type = "🎯 Kusursuz Ret (Bullish Rejection)"
+        signal_type = "🎯 Kusursuz Ret (Tam Alım)"
         
-    # SİNYAL 2: Radar/Pusu Modu (Fiyat şu an tam bölgenin içinde tepki bekliyor)
+    # SİNYAL 2: Radar/Pusu Modu (İçeride bekliyor)
     elif gz_lower <= curr_close <= gz_upper:
         signal = True
-        signal_type = "⏳ Pusu Modu: Fiyat Altın Bölge İçinde"
+        signal_type = "⏳ Pusu Modu: Altın Bölge İçinde"
         
-    # SİNYAL 3: Güvenli Alım (Bölgeye değdi ve yukarı doğru kırılım başladı)
+    # SİNYAL 3: Güvenli Alım (Daha önce değdi, şimdi yukarı gidiyor)
     elif touched_zone and curr_close > gz_upper and curr_close > curr_open:
         signal = True
         signal_type = "🚀 Bölgeden Onaylı Çıkış"
         
+    # SİNYAL 4: YAKLAŞANLAR (Bölgeye %2.5 veya daha az kalmış)
+    elif 0 < distance_to_zone_pct <= 0.025:
+        signal = True
+        signal_type = f"👀 Yaklaşıyor (Mesafe: %{distance_to_zone_pct*100:.1f})"
+        
     if signal:
         tp_1618 = leg_high + (rng * 0.618)
-        # Zarar Kes (Stop Loss), başladığı yükseliş dibinin bir tık altıdır
         stop_loss = leg_low * 0.99
         
         return {
@@ -150,34 +156,6 @@ def find_golden_zone_vectorized(df):
             "stop_loss": stop_loss
         }
         
-    return None
-
-def analyze_ticker(symbol, mkt_config, interval):
-    clean_symbol = symbol.replace('.', '-')
-    yf_ticker = f"{clean_symbol}{mkt_config['yf_suffix']}"
-    
-    try:
-        # Yfinance veri limiti kuralları ihlal edilmeden en geniş veriyi çek
-        if interval in ["1h", "90m"]: period = "1mo"
-        elif interval == "1d": period = "1y"
-        else: period = "2y"
-        
-        df = yf.download(tickers=yf_ticker, period=period, interval=interval, progress=False, show_errors=False)
-        
-        if df.empty or len(df) < 50:
-            return None
-            
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-            
-        result = find_golden_zone_vectorized(df)
-        if result and result["signal"]:
-            result["ticker"] = symbol
-            result["df"] = df
-            result["current_price"] = df['Close'].iloc[-1]
-            return result
-    except Exception:
-        pass
     return None
 
 # ==========================================
@@ -216,7 +194,7 @@ def plot_setup(result):
 # 5. STREAMLIT ARAYÜZ MİMARİSİ
 # ==========================================
 st.title("🦅 HexaTrades Golden Zone Kuantitatif Tarayıcı")
-st.markdown("Piyasadaki hacimli hisseler taranır. Sistem, **Altın Bölge'de olanları** listeler.")
+st.markdown("Piyasadaki hacimli hisseler toplu (bulk) olarak çekilir ve hata payı olmadan analiz edilir.")
 st.markdown("---")
 
 col1, col2 = st.columns([1, 3])
@@ -239,38 +217,55 @@ with col2:
             st.error("Bağlantı hatası: TradingView'den hisse listesi alınamadı.")
             st.stop()
             
-        st.success(f"Başarılı! Toplam **{len(tv_symbols)}** hisse analiz ediliyor. İşlem sürüyor...")
+        yf_tickers = [f"{t.replace('.', '-')}{mkt_config['yf_suffix']}" for t in tv_symbols]
         
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+        st.info(f"Yfinance üzerinden {len(yf_tickers)} hissenin verisi IP engeline takılmamak için toplu indiriliyor. Bu işlem 10-20 saniye sürebilir...")
+        
+        period = "1mo" if interval == "1h" else ("1y" if interval == "1d" else "2y")
+        
+        # TOPLU İNDİRME MİMARİSİ (YF Rate Limit Aşımı)
+        try:
+            df_all = yf.download(yf_tickers, period=period, interval=interval, group_by='ticker', threads=True, progress=False, show_errors=False)
+        except Exception as e:
+            st.error("Veri indirme sırasında hata oluştu. Lütfen tekrar deneyin.")
+            st.stop()
+            
         signals = []
         
-        completed = 0
-        total_tickers = len(tv_symbols)
+        st.info("Veriler indirildi, Golden Zone algoritmaları çalıştırılıyor...")
+        progress_bar = st.progress(0)
         
-        with ThreadPoolExecutor(max_workers=20) as executor:
-            future_to_ticker = {executor.submit(analyze_ticker, t, mkt_config, interval): t for t in tv_symbols}
-            
-            for future in as_completed(future_to_ticker):
-                res = future.result()
-                if res:
-                    signals.append(res)
+        for i, (symbol, yf_ticker) in enumerate(zip(tv_symbols, yf_tickers)):
+            try:
+                # MultiIndex sütun mimarisine göre veriyi ayır
+                if len(tv_symbols) > 1:
+                    df = df_all[yf_ticker].dropna(how='all')
+                else:
+                    df = df_all.dropna(how='all')
                     
-                completed += 1
-                if completed % 5 == 0 or completed == total_tickers:
-                    progress_bar.progress(completed / total_tickers)
-                    status_text.text(f"İşlenen: {completed} / {total_tickers} | Bulunan Fırsat: {len(signals)}")
+                if not df.empty and len(df) > 50:
+                    df.columns = [str(c).capitalize() for c in df.columns]
+                    result = find_golden_zone_vectorized(df)
+                    if result and result["signal"]:
+                        result["ticker"] = symbol
+                        result["df"] = df
+                        result["current_price"] = df['Close'].iloc[-1]
+                        signals.append(result)
+            except Exception:
+                pass
+            
+            progress_bar.progress((i + 1) / len(tv_symbols))
                 
         progress_bar.empty()
-        status_text.empty()
         
         st.markdown("---")
         if not signals:
-            st.warning("Seçilen periyotta Altın Bölge kriterlerini karşılayan hisse bulunamadı. Lütfen zaman periyodunu değiştirerek tekrar deneyin.")
+            st.warning("Seçilen periyotta Altın Bölge kriterlerini veya yaklaşma (radar) şartını karşılayan hisse bulunamadı.")
         else:
-            signals.sort(key=lambda x: "Pusu" in x["signal_type"])
+            # Önce tam alım noktaları, sonra yaklaşanlar görünecek şekilde sırala
+            signals.sort(key=lambda x: "Yaklaşıyor" in x["signal_type"])
             
-            st.success(f"🎯 Toplam **{len(signals)}** adet hissede Golden Zone fırsatı tespit edildi!")
+            st.success(f"🎯 Toplam **{len(signals)}** adet hissede Golden Zone fırsatı veya radar sinyali tespit edildi!")
             
             for res in signals:
                 ticker = res["ticker"]
@@ -278,8 +273,8 @@ with col2:
                 tp_p = float(res["tp"])
                 kar_potansiyeli = ((tp_p - current_p) / current_p) * 100
                 
-                is_pusu = "Pusu" in res['signal_type']
-                icon = "⏳" if is_pusu else "🟢"
+                is_yaklasan = "Yaklaşıyor" in res['signal_type']
+                icon = "👀" if is_yaklasan else "🎯"
                 
                 tv_link = f"https://www.tradingview.com/chart/?symbol={mkt_config['tv_prefix']}{ticker}"
                 
