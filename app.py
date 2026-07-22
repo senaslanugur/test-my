@@ -7,6 +7,7 @@ import matplotlib.dates as mdates
 import seaborn as sns
 import requests
 import warnings
+from datetime import datetime, timedelta
 
 warnings.filterwarnings("ignore")
 
@@ -23,11 +24,14 @@ st.markdown("""
         h1, h2, h3 { font-weight: 800; letter-spacing: -0.5px; color: #e5e7eb; }
         code, .stCodeBlock code { font-family: 'JetBrains Mono', monospace; font-size: 0.85em; color: #10b981; }
         div[data-testid="stExpander"] { background-color: #111827; border: 1px solid #1f2937; border-radius: 2px;}
+        .metric-card { background-color: #1f2937; padding: 15px; border-radius: 5px; border-left: 4px solid #3b82f6; text-align: center; }
+        .metric-value { font-size: 24px; font-weight: bold; color: #e5e7eb; }
+        .metric-label { font-size: 12px; color: #9ca3af; text-transform: uppercase; }
     </style>
 """, unsafe_allow_html=True)
 
 # =============================================================================
-# 2. GLOBAL KONFİGÜRASYONLAR VE PERİYOT (TIMEFRAME) AYARLARI
+# 2. GLOBAL KONFİGÜRASYONLAR
 # =============================================================================
 MARKET_CONFIGS = {
     "Türkiye (BIST)": {"tv_market": "turkey", "yf_suffix": ".IS", "tv_prefix": "BIST:"},
@@ -35,11 +39,11 @@ MARKET_CONFIGS = {
 }
 
 TIMEFRAME_CONFIGS = {
-    "1 Saatlik (1H)": {"interval": "1h", "period": "6mo", "resample_rule": None},
-    "2 Saatlik (2H)": {"interval": "1h", "period": "6mo", "resample_rule": "2h"},
-    "4 Saatlik (4H)": {"interval": "1h", "period": "6mo", "resample_rule": "4h"},
-    "1 Günlük (1D)": {"interval": "1d", "period": "1y", "resample_rule": None},
-    "1 Haftalık (1W)": {"interval": "1wk", "period": "3y", "resample_rule": None}
+    "1 Saatlik (1H)": {"interval": "1h", "period": "730d", "resample_rule": None}, # yf limit for 1h is 730 days
+    "2 Saatlik (2H)": {"interval": "1h", "period": "730d", "resample_rule": "2h"},
+    "4 Saatlik (4H)": {"interval": "1h", "period": "730d", "resample_rule": "4h"},
+    "1 Günlük (1D)": {"interval": "1d", "period": "max", "resample_rule": None},
+    "1 Haftalık (1W)": {"interval": "1wk", "period": "max", "resample_rule": None}
 }
 
 # =============================================================================
@@ -59,7 +63,7 @@ def get_all_market_symbols(mkt_config):
     try:
         resp = requests.post(url, json=payload, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
         if resp.status_code == 200:
-            return [item["d"][0] for item in resp.json().get("data", [])]
+            return sorted([item["d"][0] for item in resp.json().get("data", [])])
     except Exception:
         pass
     return []
@@ -68,320 +72,389 @@ def get_all_market_symbols(mkt_config):
 def fetch_data_cached(tickers, period, interval):
     return yf.download(tickers=tickers, period=period, interval=interval, group_by="ticker", threads=True, progress=False)
 
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_single_historical_data(ticker, interval, start_date, end_date):
+    return yf.download(ticker, start=start_date, end=end_date, interval=interval, progress=False)
+
 # =============================================================================
-# 4. KANTİTATİF ALGORİTMA: STATE MACHINE (DURUM HAFIZALI) PINE MİMARİSİ
+# 4. KANTİTATİF ALGORİTMA: STATE MACHINE (ORTAK ÇEKİRDEK)
 # =============================================================================
-def evaluate_golden_zone_state_machine(df, signal_window=5):
-    pivotLen = 15
-    confirmBars = 5
-    zzDevAtr = 1.5
-    invBufAtr = 0.3
-    goldenLower = 0.5
-    goldenUpper = 0.618
+def core_pine_state_machine(df):
+    """Hem tarayıcı hem de backtest için çalışan saf Pine Script çekirdeği."""
+    pivotLen, confirmBars, zzDevAtr, invBufAtr = 15, 5, 1.5, 0.3
+    goldenLower, goldenUpper = 0.5, 0.618
     
-    highs = df['High'].values
-    lows = df['Low'].values
-    closes = df['Close'].values
-    opens = df['Open'].values
+    highs, lows = df['High'].values, df['Low'].values
+    closes, opens = df['Close'].values, df['Open'].values
+    dates = df.index
     
-    # ATR (RMA) Hesaplaması
     tr = np.maximum(highs[1:] - lows[1:], np.abs(highs[1:] - closes[:-1]))
     tr = np.maximum(tr, np.abs(lows[1:] - closes[:-1]))
     tr = np.insert(tr, 0, highs[0] - lows[0])
     atr = np.zeros_like(tr)
     atr[0] = tr[0]
-    alpha = 1.0 / 14
-    for i in range(1, len(tr)):
-        atr[i] = alpha * tr[i] + (1 - alpha) * atr[i-1]
+    for i in range(1, len(tr)): atr[i] = (1/14) * tr[i] + (1 - 1/14) * atr[i-1]
         
     N = len(highs)
-    if N < pivotLen + confirmBars:
-        return False, None
-        
-    zzP1 = np.nan; zzP0 = np.nan
-    zzD1 = 0
-    zzLow = np.nan; zzHigh = np.nan
     
-    aSet = False; aAlive = False
-    aHigh = np.nan; aLow = np.nan
-    gTop = np.nan; gBot = np.nan
-    aRejected = False
-    
+    zzP1, zzP0, zzD1, zzLow, zzHigh = np.nan, np.nan, 0, np.nan, np.nan
+    aSet, aAlive, aHigh, aLow, gTop, gBot, aRejected = False, False, np.nan, np.nan, np.nan, np.nan, False
     trailing_stop = np.nan
-    in_position = False  # Portföy Durum Hafızası (Sanal İşlem)
+    in_position = False
     
-    signal_triggered = False
-    signal_data = {}
+    trades = []
+    entry_price, entry_date, entry_type = 0, None, ""
+    
+    # Tarayıcı için son durum
+    latest_state = {"signal": False, "data": None}
     
     for i in range(pivotLen + confirmBars, N):
-        isZigZagHigh = False
-        isZigZagLow = False
-        zzLegEvent = False
-        
+        isZigZagHigh, isZigZagLow, zzLegEvent = False, False, False
         idx_eval = i - confirmBars
-        window_high = highs[idx_eval - pivotLen : i + 1]
-        window_low = lows[idx_eval - pivotLen : i + 1]
+        window_high, window_low = highs[idx_eval - pivotLen : i + 1], lows[idx_eval - pivotLen : i + 1]
         
-        usePH = np.nan; usePL = np.nan
+        usePH, usePL = np.nan, np.nan
         if highs[idx_eval] == np.max(window_high): usePH = highs[idx_eval]
         if lows[idx_eval] == np.min(window_low): usePL = lows[idx_eval]
             
         if not np.isnan(usePH) and not np.isnan(usePL):
-            if np.isnan(zzP1):
-                usePH = np.nan; usePL = np.nan
+            if np.isnan(zzP1): usePH, usePL = np.nan, np.nan
             else:
-                dH = abs(usePH - zzP1); dL = abs(usePL - zzP1)
+                dH, dL = abs(usePH - zzP1), abs(usePL - zzP1)
                 if dH > dL: usePL = np.nan
                 elif dL > dH: usePH = np.nan
-                else: usePH = np.nan; usePL = np.nan
+                else: usePH, usePL = np.nan, np.nan
         
-        pivotAtr = atr[idx_eval] if not np.isnan(atr[idx_eval]) else 0
-        zzMinLeg = zzDevAtr * pivotAtr
+        zzMinLeg = zzDevAtr * (atr[idx_eval] if not np.isnan(atr[idx_eval]) else 0)
         
         if not np.isnan(usePH):
             if zzD1 == 1:
-                if usePH > zzP1: zzP1 = usePH; zzHigh = usePH; zzLegEvent = True; isZigZagHigh = True
-            elif np.isnan(zzP1): zzP1 = usePH; zzD1 = 1; zzHigh = usePH; isZigZagHigh = True
-            elif abs(usePH - zzP1) > zzMinLeg: zzP0 = zzP1; zzP1 = usePH; zzD1 = 1; zzHigh = usePH; zzLegEvent = True; isZigZagHigh = True
+                if usePH > zzP1: zzP1 = zzHigh = usePH; zzLegEvent = isZigZagHigh = True
+            elif np.isnan(zzP1): zzP1 = zzHigh = usePH; zzD1 = 1; isZigZagHigh = True
+            elif abs(usePH - zzP1) > zzMinLeg: zzP0 = zzP1; zzP1 = zzHigh = usePH; zzD1 = 1; zzLegEvent = isZigZagHigh = True
                 
         if not np.isnan(usePL):
             if zzD1 == -1:
-                if usePL < zzP1: zzP1 = usePL; zzLow = usePL; zzLegEvent = True; isZigZagLow = True
-            elif np.isnan(zzP1): zzP1 = usePL; zzD1 = -1; zzLow = usePL; isZigZagLow = True
-            elif abs(usePL - zzP1) > zzMinLeg: zzP0 = zzP1; zzP1 = usePL; zzD1 = -1; zzLow = usePL; zzLegEvent = True; isZigZagLow = True
+                if usePL < zzP1: zzP1 = zzLow = usePL; zzLegEvent = isZigZagLow = True
+            elif np.isnan(zzP1): zzP1 = zzLow = usePL; zzD1 = -1; isZigZagLow = True
+            elif abs(usePL - zzP1) > zzMinLeg: zzP0 = zzP1; zzP1 = zzLow = usePL; zzD1 = -1; zzLegEvent = isZigZagLow = True
                 
-        # ATR Trailing Stop Güncellemesi (Sadece dip oluştuğunda)
-        if isZigZagLow and not np.isnan(zzLow):
-            trailing_stop = zzLow - (invBufAtr * atr[i])
+        if isZigZagLow and not np.isnan(zzLow): trailing_stop = zzLow - (invBufAtr * atr[i])
             
         validLeg = (zzD1 != 0) and not np.isnan(zzP0) and not np.isnan(zzP1) and (zzP0 != zzP1)
         dirBull = (zzD1 == 1)
         legHigh = max(zzP0, zzP1) if validLeg else np.nan
         legLow = min(zzP0, zzP1) if validLeg else np.nan
         
-        validSetup = validLeg and (legHigh > legLow)
-        
-        if zzLegEvent and validSetup:
-            aSet = True; aAlive = True
-            aHigh = legHigh; aLow = legLow
-            aRejected = False
-            rng = aHigh - aLow
-            gTop = aHigh - (goldenLower * rng)
-            gBot = aHigh - (goldenUpper * rng)
+        if zzLegEvent and (validLeg and (legHigh > legLow)):
+            aSet, aAlive, aHigh, aLow, aRejected = True, True, legHigh, legLow, False
+            gTop, gBot = aHigh - (goldenLower * (aHigh - aLow)), aHigh - (goldenUpper * (aHigh - aLow))
             
         activeValid = aSet and aAlive and not np.isnan(aHigh) and not np.isnan(aLow) and (aHigh - aLow) > 0
         evBullRej = False
         
         if activeValid and dirBull:
-            touchWick = (lows[i] <= gTop)
-            bullRejectRaw = touchWick and (closes[i] > gTop) and (closes[i] > opens[i])
-            if bullRejectRaw and not aRejected:
-                aRejected = True
-                evBullRej = True
+            if (lows[i] <= gTop) and (closes[i] > gTop) and (closes[i] > opens[i]) and not aRejected:
+                aRejected = True; evBullRej = True
                 
         longEnter = (evBullRej or isZigZagLow) and activeValid and dirBull
         longExit = (not np.isnan(trailing_stop)) and (closes[i] < trailing_stop)
         
-        # --- DURUM MAKİNESİ (Sanal Portföy & Pine Script İşlem Yönetimi) ---
-        current_bar_signal = None
-        
+        # --- İŞLEM YÖNETİMİ (BACKTEST İÇİN) ---
         if in_position:
             if longExit:
                 in_position = False
-                trailing_stop = np.nan # Stop patladı, satıldı
-                current_bar_signal = "Sat (Trend Bozuldu)"
-            elif longEnter:
-                current_bar_signal = "📈 Trend İçi Ekleme (Zaten Al'da)"
+                exit_price = closes[i]
+                pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+                trades.append({
+                    'Giriş Tarihi': entry_date, 'Giriş Fiyatı': entry_price, 'Tetikleyici': entry_type,
+                    'Çıkış Tarihi': dates[i], 'Çıkış Fiyatı': exit_price, 'Kâr/Zarar (%)': round(pnl_pct, 2)
+                })
+                trailing_stop = np.nan
         else:
             if longEnter:
                 in_position = True
-                if evBullRej:
-                    current_bar_signal = "🎯 Taze Alım (Kusursuz Ret)"
-                elif isZigZagLow:
-                    current_bar_signal = "🔥 Taze Alım (Trend/Dip Onayı)"
-        
-        # Sinyal Penceresi Taraması
-        if i >= N - signal_window:
-            if current_bar_signal and "Sat" not in current_bar_signal:
-                signal_triggered = True
+                entry_price, entry_date = closes[i], dates[i]
+                entry_type = "Kusursuz Ret" if evBullRej else "Trend/Dip Onayı"
+                
+        # --- TARAYICI (SCANNER) DURUM GÜNCELLEMESİ ---
+        if i >= N - 5: # Son 5 bar sinyal penceresi
+            current_bar_signal = None
+            if in_position and longEnter and i == N-1: current_bar_signal = "📈 Trend İçi Ekleme"
+            elif not in_position and longEnter: current_bar_signal = "🎯 Taze Alım (Kusursuz Ret)" if evBullRej else "🔥 Taze Alım (Trend/Dip Onayı)"
+            
+            if current_bar_signal:
                 bars_ago = (N - 1) - i
                 ext = f" ({bars_ago} bar önce)" if bars_ago > 0 else ""
-                
-                signal_data = {
-                    "type": current_bar_signal + ext,
-                    "gz_lower": gBot, "gz_upper": gTop,
-                    "tp": aHigh + ((aHigh - aLow) * 0.618),
-                    "last_high": aHigh,
-                    "stop": trailing_stop if not np.isnan(trailing_stop) else aLow
+                latest_state = {
+                    "signal": True,
+                    "data": {
+                        "type": current_bar_signal + ext, "gz_lower": gBot, "gz_upper": gTop,
+                        "tp": aHigh + ((aHigh - aLow) * 0.618), "last_high": aHigh,
+                        "stop": trailing_stop if not np.isnan(trailing_stop) else aLow
+                    }
                 }
                 
-    # O ANKİ bar için Pusu veya Yaklaşma durumu (Sadece Nakitteysek geçerli)
-    if not signal_triggered and activeValid and dirBull and not in_position:
+    # Nakitteysek Pusu/Yaklaşma Kontrolü (Son bar)
+    if not latest_state["signal"] and activeValid and dirBull and not in_position:
         curr_close = closes[-1]
         dist_pct = (curr_close - gTop) / gTop
         if gBot <= curr_close <= gTop:
-            signal_triggered = True
-            signal_data = {
-                "type": "⏳ Pusu Modu (Nakitte, Bölge İçi Bekleyiş)",
-                "gz_lower": gBot, "gz_upper": gTop,
-                "tp": aHigh + ((aHigh - aLow) * 0.618),
-                "last_high": aHigh,
-                "stop": trailing_stop if not np.isnan(trailing_stop) else aLow
-            }
+            latest_state = {"signal": True, "data": {"type": "⏳ Pusu Modu", "gz_lower": gBot, "gz_upper": gTop, "tp": aHigh + ((aHigh - aLow) * 0.618), "last_high": aHigh, "stop": trailing_stop if not np.isnan(trailing_stop) else aLow}}
         elif 0 < dist_pct <= 0.025:
-            signal_triggered = True
-            signal_data = {
-                "type": f"👀 Yaklaşıyor (+%{dist_pct*100:.1f}) (Nakitte)",
-                "gz_lower": gBot, "gz_upper": gTop,
-                "tp": aHigh + ((aHigh - aLow) * 0.618),
-                "last_high": aHigh,
-                "stop": trailing_stop if not np.isnan(trailing_stop) else aLow
-            }
+            latest_state = {"signal": True, "data": {"type": f"👀 Yaklaşıyor (+%{dist_pct*100:.1f})", "gz_lower": gBot, "gz_upper": gTop, "tp": aHigh + ((aHigh - aLow) * 0.618), "last_high": aHigh, "stop": trailing_stop if not np.isnan(trailing_stop) else aLow}}
 
-    if signal_triggered:
-        return True, signal_data
-        
-    return False, None
+    return latest_state, trades
 
 # =============================================================================
-# 5. PROFESYONEL GRAFİK ÇİZİMİ
+# 5. GRAFİK ÇİZİM MOTOLARI
 # =============================================================================
 def draw_gz_chart(symbol, df, ctx):
     plot_df = df.tail(100).copy()
     plt_subplots.style.use('dark_background')
     fig, ax = plt_subplots.subplots(figsize=(12, 6))
     
-    up = plot_df['Close'] >= plot_df['Open']
-    down = plot_df['Close'] < plot_df['Open']
-    width = 0.6
-    
-    ax.bar(plot_df.index[up], plot_df['Close'][up] - plot_df['Open'][up], width, bottom=plot_df['Open'][up], color='#10b981')
-    ax.bar(plot_df.index[down], plot_df['Open'][down] - plot_df['Close'][down], width, bottom=plot_df['Close'][down], color='#ef4444')
+    up, down = plot_df['Close'] >= plot_df['Open'], plot_df['Close'] < plot_df['Open']
+    ax.bar(plot_df.index[up], plot_df['Close'][up] - plot_df['Open'][up], 0.6, bottom=plot_df['Open'][up], color='#10b981')
+    ax.bar(plot_df.index[down], plot_df['Open'][down] - plot_df['Close'][down], 0.6, bottom=plot_df['Close'][down], color='#ef4444')
     ax.vlines(plot_df.index[up], plot_df['Low'][up], plot_df['High'][up], color='#10b981', linewidth=1)
     ax.vlines(plot_df.index[down], plot_df['Low'][down], plot_df['High'][down], color='#ef4444', linewidth=1)
     
     ax.axhspan(ctx["gz_lower"], ctx["gz_upper"], color='#f59e0b', alpha=0.2, label='Altın Bölge (Golden Pocket)')
     ax.axhline(ctx["tp"], color='#00ffff', linestyle='--', linewidth=1.5, label='Kâr Al (1.618 Projeksiyon)')
-    
-    if not np.isnan(ctx["stop"]):
-        ax.axhline(ctx["stop"], color='#ef4444', linestyle=':', linewidth=2.5, label='ATR İzleyen Stop Loss')
+    if not np.isnan(ctx["stop"]): ax.axhline(ctx["stop"], color='#ef4444', linestyle=':', linewidth=2.5, label='ATR İzleyen Stop Loss')
         
-    ax.axhline(ctx["last_high"], color='#9ca3af', linestyle='-', linewidth=1, alpha=0.5, label='Son Zirve')
-    
     ax.set_title(f"{symbol} | DURUM: {ctx['type']}", color='#e5e7eb', fontsize=12, fontweight='bold', loc='left')
     ax.legend(loc='upper left', frameon=False, labelcolor='white')
     ax.grid(True, alpha=0.1)
-    
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
     fig.autofmt_xdate()
     plt_subplots.tight_layout()
     return fig
 
+def draw_equity_curve(trades_df):
+    plt_subplots.style.use('dark_background')
+    fig, ax = plt_subplots.subplots(figsize=(14, 5))
+    
+    trades_df['Kümülatif Getiri (%)'] = trades_df['Kâr/Zarar (%)'].cumsum()
+    
+    # Sıfır çizgisi
+    ax.axhline(0, color='#ffffff', linestyle='-', alpha=0.3)
+    
+    # Özsermaye eğrisi
+    color = '#10b981' if trades_df['Kümülatif Getiri (%)'].iloc[-1] >= 0 else '#ef4444'
+    ax.plot(trades_df['Çıkış Tarihi'], trades_df['Kümülatif Getiri (%)'], color=color, linewidth=2.5, marker='o', markersize=5)
+    ax.fill_between(trades_df['Çıkış Tarihi'], trades_df['Kümülatif Getiri (%)'], 0, color=color, alpha=0.15)
+    
+    ax.set_title("STRATEJİ KÜMÜLATİF GETİRİ EĞRİSİ (EQUITY CURVE)", color='#e5e7eb', fontsize=12, fontweight='bold')
+    ax.set_ylabel("Net Getiri (%)", color='#9ca3af')
+    ax.grid(True, alpha=0.1)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+    fig.autofmt_xdate()
+    plt_subplots.tight_layout()
+    return fig
+
 # =============================================================================
-# 6. ARAYÜZ (UI) MİMARİSİ
+# 6. ARAYÜZ (UI) MİMARİSİ (ÇİFT MOTOR)
 # =============================================================================
 st.title("📈 GOLDEN ZONE WORKSTATION")
-st.write("---")
 
-col_mkt, col_tf, col_btn = st.columns([2, 2, 1])
-with col_mkt: selected_mkt = st.selectbox("Piyasa Seçin:", list(MARKET_CONFIGS.keys()))
-with col_tf: selected_tf = st.selectbox("Zaman Periyodu:", list(TIMEFRAME_CONFIGS.keys()))
-with col_btn: 
-    st.write("##")
-    execute_scan = st.button("TARAMAYI BAŞLAT")
+tab_scanner, tab_backtest = st.tabs(["🚀 CANLI TARAYICI (SCANNER)", "🔬 BACKTEST LABORATUVARI (PERFORMANS)"])
 
-if execute_scan:
-    mkt_config = MARKET_CONFIGS[selected_mkt]
-    tf_config = TIMEFRAME_CONFIGS[selected_tf]
-    
-    st.write("### 🖥️ SİSTEM LOG KONSOLU")
-    console_placeholder = st.empty()
-    live_logs = ["[SYSTEM]: TradingView'den piyasa hacim listesi alınıyor..."]
-    console_placeholder.code("\n".join(live_logs))
-    
-    market_symbols = get_all_market_symbols(mkt_config)
-    
-    if not market_symbols:
-        live_logs.append("[ERROR]: TradingView sunucularına ulaşılamadı.")
-        console_placeholder.code("\n".join(live_logs[-15:]))
-    else:
-        yf_tickers = [f"{s.replace('.', '-')}{mkt_config['yf_suffix']}" for s in market_symbols]
-        live_logs.append(f"[SYSTEM]: {len(market_symbols)} hissenin verisi tek pakette indiriliyor...")
-        console_placeholder.code("\n".join(live_logs[-15:]))
+# -----------------------------------------------------------------------------
+# TAB 1: CANLI TARAYICI
+# -----------------------------------------------------------------------------
+with tab_scanner:
+    col_mkt, col_tf, col_btn = st.columns([2, 2, 1])
+    with col_mkt: selected_mkt = st.selectbox("Piyasa Seçin:", list(MARKET_CONFIGS.keys()), key="mkt_scan")
+    with col_tf: selected_tf = st.selectbox("Zaman Periyodu:", list(TIMEFRAME_CONFIGS.keys()), key="tf_scan")
+    with col_btn: 
+        st.write("##")
+        execute_scan = st.button("TARAMAYI BAŞLAT", use_container_width=True)
+
+    if execute_scan:
+        mkt_config = MARKET_CONFIGS[selected_mkt]
+        tf_config = TIMEFRAME_CONFIGS[selected_tf]
         
-        df_all = fetch_data_cached(yf_tickers, tf_config["period"], tf_config["interval"])
+        st.write("### 🖥️ SİSTEM LOG KONSOLU")
+        console_placeholder = st.empty()
+        live_logs = ["[SYSTEM]: TradingView'den piyasa hacim listesi alınıyor..."]
+        console_placeholder.code("\n".join(live_logs))
         
-        live_logs.append(f"[SYSTEM]: İndirme tamamlandı. {selected_tf} periyodu için durum makinesi analiz başlıyor...")
-        console_placeholder.code("\n".join(live_logs[-15:]))
+        market_symbols = get_all_market_symbols(mkt_config)
         
-        p_bar = st.progress(0)
-        found_signals = []
-        stored_dfs = {}
-        
-        for idx, symbol in enumerate(market_symbols):
-            p_bar.progress((idx + 1) / len(market_symbols))
-            yf_ticker_key = f"{symbol.replace('.', '-')}{mkt_config['yf_suffix']}"
-            
-            if hasattr(df_all.columns, 'levels') and yf_ticker_key in df_all.columns.levels[0]:
-                df_symbol = df_all[yf_ticker_key].dropna(subset=['High', 'Close', 'Low', 'Open']).copy()
-            elif len(yf_tickers) == 1:
-                df_symbol = df_all.dropna(subset=['High', 'Close', 'Low', 'Open']).copy()
-            else:
-                live_logs.append(f"[SKIP] {symbol:<6} : Veri seti eksik veya tahta kapalı.")
-                console_placeholder.code("\n".join(live_logs[-15:]))
-                continue
-                
-            if tf_config["resample_rule"]:
-                try:
-                    df_symbol.index = pd.to_datetime(df_symbol.index)
-                    df_symbol = df_symbol.resample(tf_config["resample_rule"]).agg({
-                        'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
-                    }).dropna()
-                except Exception:
-                    continue
-                
-            if len(df_symbol) < 50:
-                continue
-                
-            is_setup, ctx = evaluate_golden_zone_state_machine(df_symbol)
-            
-            if is_setup:
-                # Loglara sade halini bas
-                live_logs.append(f"[MATCH] {symbol:<6} : {ctx['type'].split('(')[0].strip()}")
-                console_placeholder.code("\n".join(live_logs[-15:]))
-                
-                curr_price = float(df_symbol['Close'].iloc[-1])
-                tv_interval_map = {"1h": "60", "2h": "120", "4h": "240", "1d": "D", "1wk": "W"}
-                tv_interval = tv_interval_map.get(tf_config["resample_rule"] or tf_config["interval"], "D")
-                tv_url = f"https://www.tradingview.com/chart/?symbol={mkt_config['tv_prefix']}{symbol}&interval={tv_interval}"
-                
-                found_signals.append({
-                    "Durum": ctx["type"],
-                    "Hisse": symbol,
-                    "Fiyat": round(curr_price, 2),
-                    "Giriş (Altın Bölge)": f"{ctx['gz_lower']:.2f} - {ctx['gz_upper']:.2f}",
-                    "Kâr Hedefi": round(ctx["tp"], 2),
-                    "Stop Loss": round(ctx["stop"], 2),
-                    "Bağlantı": tv_url
-                })
-                stored_dfs[symbol] = {"df": df_symbol, "ctx": ctx}
-        
-        p_bar.empty()
-        st.markdown(f"<div style='color:#10b981; font-family:Inter; font-weight:600;'>[SİSTEM BİLGİSİ] {selected_tf} Taraması başarıyla tamamlandı.</div>", unsafe_allow_html=True)
-        
-        if found_signals:
-            st.write("---")
-            st.write(f"### 🏆 ONAYLANMIŞ FIRSATLAR VE DURUMLAR ({selected_tf})")
-            
-            # Taze alımları en üste alacak şekilde basit sıralama
-            res_df = pd.DataFrame(found_signals).sort_values(by="Durum", ascending=False)
-            st.dataframe(res_df, use_container_width=True, hide_index=True,
-                         column_config={"Bağlantı": st.column_config.LinkColumn("TradingView", display_text="Grafiği Aç")})
-            
-            st.write("---")
-            st.write("### 🔬 GRAFİK İNCELEME İSTASYONU")
-            selected_plot = st.selectbox("Detaylı inceleme için hisse seçin:", list(stored_dfs.keys()))
-            if selected_plot:
-                st.pyplot(draw_gz_chart(selected_plot, stored_dfs[selected_plot]["df"], stored_dfs[selected_plot]["ctx"]))
+        if not market_symbols:
+            live_logs.append("[ERROR]: TradingView sunucularına ulaşılamadı.")
+            console_placeholder.code("\n".join(live_logs[-15:]))
         else:
-            st.warning(f"Bu periyotta ({selected_tf}) tespit edilen aktif bir durum bulunamadı.")
+            yf_tickers = [f"{s.replace('.', '-')}{mkt_config['yf_suffix']}" for s in market_symbols]
+            live_logs.append(f"[SYSTEM]: {len(market_symbols)} hissenin verisi tek pakette indiriliyor...")
+            console_placeholder.code("\n".join(live_logs[-15:]))
+            
+            df_all = fetch_data_cached(yf_tickers, tf_config["period"], tf_config["interval"])
+            
+            live_logs.append(f"[SYSTEM]: İndirme tamamlandı. {selected_tf} taraması başlıyor...")
+            console_placeholder.code("\n".join(live_logs[-15:]))
+            
+            p_bar = st.progress(0)
+            found_signals = []
+            stored_dfs = {}
+            
+            for idx, symbol in enumerate(market_symbols):
+                p_bar.progress((idx + 1) / len(market_symbols))
+                yf_ticker_key = f"{symbol.replace('.', '-')}{mkt_config['yf_suffix']}"
+                
+                if hasattr(df_all.columns, 'levels') and yf_ticker_key in df_all.columns.levels[0]:
+                    df_symbol = df_all[yf_ticker_key].dropna(subset=['High', 'Close', 'Low', 'Open']).copy()
+                elif len(yf_tickers) == 1:
+                    df_symbol = df_all.dropna(subset=['High', 'Close', 'Low', 'Open']).copy()
+                else: continue
+                    
+                if tf_config["resample_rule"]:
+                    try:
+                        df_symbol.index = pd.to_datetime(df_symbol.index)
+                        df_symbol = df_symbol.resample(tf_config["resample_rule"]).agg({
+                            'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
+                        }).dropna()
+                    except Exception: continue
+                    
+                if len(df_symbol) < 50: continue
+                    
+                state, _ = core_pine_state_machine(df_symbol)
+                
+                if state["signal"]:
+                    ctx = state["data"]
+                    live_logs.append(f"[MATCH] {symbol:<6} : {ctx['type'].split('(')[0].strip()}")
+                    console_placeholder.code("\n".join(live_logs[-15:]))
+                    
+                    curr_price = float(df_symbol['Close'].iloc[-1])
+                    tv_interval_map = {"1h": "60", "2h": "120", "4h": "240", "1d": "D", "1wk": "W"}
+                    tv_interval = tv_interval_map.get(tf_config["resample_rule"] or tf_config["interval"], "D")
+                    tv_url = f"https://www.tradingview.com/chart/?symbol={mkt_config['tv_prefix']}{symbol}&interval={tv_interval}"
+                    
+                    found_signals.append({
+                        "Durum": ctx["type"], "Hisse": symbol, "Fiyat": round(curr_price, 2),
+                        "Giriş (Altın Bölge)": f"{ctx['gz_lower']:.2f} - {ctx['gz_upper']:.2f}",
+                        "Kâr Hedefi": round(ctx["tp"], 2), "Stop Loss": round(ctx["stop"], 2), "Bağlantı": tv_url
+                    })
+                    stored_dfs[symbol] = {"df": df_symbol, "ctx": ctx}
+            
+            p_bar.empty()
+            st.markdown(f"<div style='color:#10b981; font-family:Inter; font-weight:600;'>[SİSTEM BİLGİSİ] {selected_tf} Taraması tamamlandı.</div>", unsafe_allow_html=True)
+            
+            if found_signals:
+                st.write("---"); st.write(f"### 🏆 ONAYLANMIŞ FIRSATLAR ({selected_tf})")
+                res_df = pd.DataFrame(found_signals).sort_values(by="Durum", ascending=False)
+                st.dataframe(res_df, use_container_width=True, hide_index=True, column_config={"Bağlantı": st.column_config.LinkColumn("TradingView", display_text="Grafiği Aç")})
+                
+                st.write("---"); st.write("### 🔬 GRAFİK İNCELEME İSTASYONU")
+                selected_plot = st.selectbox("Detaylı inceleme için hisse seçin:", list(stored_dfs.keys()))
+                if selected_plot: st.pyplot(draw_gz_chart(selected_plot, stored_dfs[selected_plot]["df"], stored_dfs[selected_plot]["ctx"]))
+            else: st.warning(f"Bu periyotta ({selected_tf}) tespit edilen aktif bir durum bulunamadı.")
+
+# -----------------------------------------------------------------------------
+# TAB 2: BACKTEST LABORATUVARI
+# -----------------------------------------------------------------------------
+with tab_backtest:
+    st.markdown("""
+        <div style='background-color:#111827; padding:15px; border-left:4px solid #f59e0b; margin-bottom:20px;'>
+            <div style='color:#e5e7eb; font-weight:600; font-size:14px; margin-bottom:5px;'>Kuantitatif Performans Laboratuvarı</div>
+            <div style='color:#9ca3af; font-size:13px;'>Seçtiğiniz hissenin geçmiş verileri üzerinde Pine Script state-machine algoritmasını bar-bar çalıştırır. Her bir Kusursuz Ret ve Trend Dip onayını kaydeder, izleyen stop (trailing stop) patladığında işlemi kapatarak kümülatif getiri raporu sunar.</div>
+        </div>
+    """, unsafe_allow_html=True)
+
+    col_mkt_bt, col_symbol_bt, col_tf_bt = st.columns([1, 1, 1])
+    
+    with col_mkt_bt: selected_mkt_bt = st.selectbox("Piyasa Seçin:", list(MARKET_CONFIGS.keys()), key="mkt_bt")
+    
+    # Dinamik hisse listesi çekimi (Arama kolaylığı için)
+    mkt_config_bt = MARKET_CONFIGS[selected_mkt_bt]
+    bt_symbols = get_all_market_symbols(mkt_config_bt)
+    
+    with col_symbol_bt: 
+        if bt_symbols:
+            # Dropdown search (Autocomplete)
+            target_symbol = st.selectbox("Hisse Sembolü Ara/Seç:", bt_symbols, key="sym_bt")
+        else:
+            target_symbol = st.text_input("Hisse Sembolü (Örn: THYAO, AAPL)", "THYAO", key="sym_bt_manual")
+            
+    with col_tf_bt: selected_tf_bt = st.selectbox("Zaman Periyodu:", list(TIMEFRAME_CONFIGS.keys()), key="tf_bt")
+
+    col_start, col_end, col_btn_bt = st.columns([1, 1, 1])
+    with col_start: start_date = st.date_input("Başlangıç Tarihi", datetime.today() - timedelta(days=365*2))
+    with col_end: end_date = st.date_input("Bitiş Tarihi", datetime.today())
+    with col_btn_bt: 
+        st.write("##")
+        run_backtest = st.button("ALGORİTMAYI TEST ET (BACKTEST)", use_container_width=True)
+        
+    st.markdown("<div style='font-size:11px; color:#6b7280;'>Not: Yahoo Finance API kısıtlamaları nedeniyle 1H, 2H ve 4H gibi saat içi periyotların geçmiş verisi en fazla son 730 gün (2 Yıl) ile sınırlıdır. Daha eski tarihler için Günlük (1D) periyot kullanınız.</div>", unsafe_allow_html=True)
+
+    if run_backtest:
+        tf_config_bt = TIMEFRAME_CONFIGS[selected_tf_bt]
+        yf_ticker_bt = f"{target_symbol.replace('.', '-')}{mkt_config_bt['yf_suffix']}"
+        
+        with st.spinner(f"{target_symbol} için veriler indiriliyor ve simülasyon çalıştırılıyor..."):
+            # Tarihli veri çekimi
+            df_bt = fetch_single_historical_data(yf_ticker_bt, tf_config_bt["interval"], start_date, end_date)
+            
+            if df_bt.empty:
+                st.error("Seçilen tarih aralığı veya periyot için veri bulunamadı. Lütfen saatlik grafikler için tarihi son 2 yıl içine çekin.")
+            else:
+                if isinstance(df_bt.columns, pd.MultiIndex):
+                    df_bt.columns = df_bt.columns.get_level_values(0)
+                    
+                # Sentetik Mum (Resampling)
+                if tf_config_bt["resample_rule"]:
+                    try:
+                        df_bt.index = pd.to_datetime(df_bt.index)
+                        df_bt = df_bt.resample(tf_config_bt["resample_rule"]).agg({
+                            'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
+                        }).dropna()
+                    except Exception:
+                        pass
+                
+                if len(df_bt) < 50:
+                    st.warning("Backtest için yeterli bar (mum) sayısı oluşmadı. Daha geniş bir tarih aralığı seçin.")
+                else:
+                    _, trades = core_pine_state_machine(df_bt)
+                    
+                    if not trades:
+                        st.info("Bu tarih aralığında ve periyotta stratejiye uygun hiçbir AL/SAT işlemi gerçekleşmedi.")
+                    else:
+                        trades_df = pd.DataFrame(trades)
+                        
+                        # İstatistiksel Hesaplamalar
+                        total_trades = len(trades_df)
+                        winning_trades = len(trades_df[trades_df['Kâr/Zarar (%)'] > 0])
+                        losing_trades = len(trades_df[trades_df['Kâr/Zarar (%)'] <= 0])
+                        win_rate = (winning_trades / total_trades) * 100
+                        cumulative_return = trades_df['Kâr/Zarar (%)'].sum()
+                        
+                        max_drawdown = 0
+                        running_max = 0
+                        cumsum_arr = trades_df['Kâr/Zarar (%)'].cumsum().values
+                        for val in cumsum_arr:
+                            if val > running_max: running_max = val
+                            dd = running_max - val
+                            if dd > max_drawdown: max_drawdown = dd
+                            
+                        # Metrik Kartları (Dashboard)
+                        st.write("---")
+                        c1, c2, c3, c4 = st.columns(4)
+                        with c1: st.markdown(f"<div class='metric-card'><div class='metric-label'>Toplam İşlem</div><div class='metric-value'>{total_trades}</div></div>", unsafe_allow_html=True)
+                        with c2: st.markdown(f"<div class='metric-card'><div class='metric-label'>Kazanma Oranı (Win-Rate)</div><div class='metric-value' style='color:#10b981;'>%{win_rate:.1f}</div></div>", unsafe_allow_html=True)
+                        with c3: st.markdown(f"<div class='metric-card'><div class='metric-label'>Kümülatif Net Getiri</div><div class='metric-value' style='color:{'#10b981' if cumulative_return>=0 else '#ef4444'};'>%{cumulative_return:.2f}</div></div>", unsafe_allow_html=True)
+                        with c4: st.markdown(f"<div class='metric-card'><div class='metric-label'>Maksimum Düşüş (Max DD)</div><div class='metric-value' style='color:#ef4444;'>-%{max_drawdown:.2f}</div></div>", unsafe_allow_html=True)
+                        
+                        # Kümülatif Getiri Grafiği
+                        st.write("##")
+                        st.pyplot(draw_equity_curve(trades_df))
+                        
+                        # İşlem Dökümü Tablosu
+                        st.write("### 📝 Detaylı İşlem Dökümü (Trade Log)")
+                        
+                        def highlight_pnl(val):
+                            color = '#10b981' if val > 0 else '#ef4444'
+                            return f'color: {color}; font-weight: bold;'
+                            
+                        st.dataframe(trades_df.style.map(highlight_pnl, subset=['Kâr/Zarar (%)']), use_container_width=True, hide_index=True)
