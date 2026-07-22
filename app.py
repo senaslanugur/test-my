@@ -67,7 +67,7 @@ def get_all_market_symbols(mkt_config):
 @st.cache_data(ttl=900, show_spinner=False) 
 def fetch_data_cached(tickers, period, interval):
     """Veriyi MultiIndex formatında toplu olarak güvenle indirir."""
-    return yf.download(tickers=tickers, period=period, interval=interval, group_by="ticker", threads=True, progress=False, show_errors=False)
+    return yf.download(tickers=tickers, period=period, interval=interval, group_by="ticker", threads=True, progress=False)
 
 # =============================================================================
 # 4. KANTİTATİF ALGORİTMA: GOLDEN ZONE VEKTÖR MOTORU
