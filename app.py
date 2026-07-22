@@ -62,9 +62,10 @@ def calculate_atr(high, low, close, period=14):
         atr[i] = alpha * tr[i] + (1 - alpha) * atr[i-1]
     return atr
 
-def evaluate_golden_zone_pine_mimic(df):
+def evaluate_golden_zone_pine_mimic(df, signal_window=3):
     """
     Pine Script v6 mantığını bar-bar iteratif olarak simüle eden çekirdek motor.
+    signal_window: Sinyalin son kaç bar içinde gerçekleştiğini tolere edeceğimiz değer.
     """
     pivotLen = 15
     confirmBars = 5
@@ -93,6 +94,7 @@ def evaluate_golden_zone_pine_mimic(df):
     
     signal_triggered = False
     signal_type = ""
+    bars_since_signal = 0
     
     if N < pivotLen + confirmBars:
         return None
@@ -182,13 +184,20 @@ def evaluate_golden_zone_pine_mimic(df):
                 
         longEnter = (evBullRej or isZigZagLow) and activeValid and dirBull
         
-        if i == N - 1:
+        # SİNYAL PENCERESİ ESNEMESİ (Son 'signal_window' kadar barı kontrol et)
+        if i >= N - signal_window:
             if longEnter:
                 signal_triggered = True
-                signal_type = "Altın Bölge (Golden Zone) Temas & Red" if evBullRej else "ZigZag Yeni Dip Onayı"
+                bars_since_signal = (N - 1) - i
+                signal_type = "Golden Zone Temas & Red" if evBullRej else "ZigZag Yeni Dip Onayı"
 
     if signal_triggered:
         tp_1618 = aHigh + (aHigh - aLow) * 0.618
+        
+        # Eğer sinyal geçmiş barlarda geldiyse, ekrana bilgi olarak yazdır
+        if bars_since_signal > 0:
+            signal_type += f" ({bars_since_signal} bar önce)"
+            
         return {
             "signal": True,
             "signal_type": signal_type,
@@ -200,6 +209,8 @@ def evaluate_golden_zone_pine_mimic(df):
             "stop_loss": trailingStop if not np.isnan(trailingStop) else aLow
         }
     return None
+
+
 
 def analyze_ticker(symbol, mkt_config, interval):
     clean_symbol = symbol.replace('.', '-')
