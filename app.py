@@ -7,7 +7,6 @@ import matplotlib.dates as mdates
 import seaborn as sns
 import requests
 import warnings
-import time
 
 # Yfinance uyarılarını terminalde gizle
 warnings.filterwarnings("ignore")
@@ -29,17 +28,21 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =============================================================================
-# 2. GLOBAL KONFİGÜRASYONLAR
+# 2. GLOBAL KONFİGÜRASYONLAR VE PERİYOT (TIMEFRAME) AYARLARI
 # =============================================================================
 MARKET_CONFIGS = {
     "Türkiye (BIST)": {"tv_market": "turkey", "yf_suffix": ".IS", "tv_prefix": "BIST:"},
     "Amerika (ABD)": {"tv_market": "america", "yf_suffix": "", "tv_prefix": ""}
 }
 
+# yfinance için 2h ve 4h periyotları doğrudan stabil değildir.
+# Bu yüzden 1h verisi çekilip Pandas ile Sentetik (Resample) Mum oluşturulur.
 TIMEFRAME_CONFIGS = {
-    "1 Saatlik (1H)": {"interval": "1h", "period": "1mo"},
-    "1 Günlük (1D)": {"interval": "1d", "period": "1y"},
-    "1 Haftalık (1W)": {"interval": "1wk", "period": "2y"}
+    "1 Saatlik (1H)": {"interval": "1h", "period": "6mo", "resample_rule": None},
+    "2 Saatlik (2H)": {"interval": "1h", "period": "6mo", "resample_rule": "2h"},
+    "4 Saatlik (4H)": {"interval": "1h", "period": "6mo", "resample_rule": "4h"},
+    "1 Günlük (1D)": {"interval": "1d", "period": "1y", "resample_rule": None},
+    "1 Haftalık (1W)": {"interval": "1wk", "period": "3y", "resample_rule": None}
 }
 
 # =============================================================================
@@ -76,6 +79,7 @@ def evaluate_golden_zone(df):
     highs, lows, closes, opens = df['High'].values, df['Low'].values, df['Close'].values, df['Open'].values
     
     pivots = []
+    # 15 bar geriye, 5 bar ileriye bakarak mutlak tepe ve dipleri bulur
     for i in range(15, len(df) - 5):
         if highs[i] == np.max(highs[i-15 : i+6]): pivots.append((i, 'H', highs[i]))
         if lows[i] == np.min(lows[i-15 : i+6]): pivots.append((i, 'L', lows[i]))
@@ -93,6 +97,8 @@ def evaluate_golden_zone(df):
     if len(zz) < 2: return False, None
         
     last_pivot, prev_pivot = zz[-1], zz[-2]
+    
+    # Trend şartı: Son pivot bir tepe olmalıdır
     if last_pivot[1] != 'H': return False, None
         
     leg_high, leg_low = last_pivot[2], prev_pivot[2]
@@ -112,10 +118,11 @@ def evaluate_golden_zone(df):
     signal_type = ""
     dist_pct = (curr_close - gz_upper) / gz_upper
     
+    # Pine Script Sinyal Kuralları
     if curr_low <= gz_upper and curr_close > gz_upper and curr_close > curr_open:
         signal, signal_type = True, "🎯 Kusursuz Ret (Tam Alım)"
     elif gz_lower <= curr_close <= gz_upper:
-        signal, signal_type = True, "⏳ Pusu Modu (Bölge İçi)"
+        signal, signal_type = True, "⏳ Pusu Modu (Bölge İçi Bekleyiş)"
     elif touched_zone and curr_close > gz_upper and curr_close > curr_open:
         signal, signal_type = True, "🚀 Bölgeden Onaylı Çıkış"
     elif 0 < dist_pct <= 0.025:
@@ -138,7 +145,7 @@ def draw_gz_chart(symbol, df, ctx):
     
     up = plot_df['Close'] >= plot_df['Open']
     down = plot_df['Close'] < plot_df['Open']
-    width, width2 = 0.6, 0.1
+    width = 0.6
     
     # Profesyonel Mum Grafiği
     ax.bar(plot_df.index[up], plot_df['Close'][up] - plot_df['Open'][up], width, bottom=plot_df['Open'][up], color='#10b981')
@@ -155,6 +162,8 @@ def draw_gz_chart(symbol, df, ctx):
     ax.set_title(f"{symbol} | DURUM: {ctx['type']}", color='#e5e7eb', fontsize=12, fontweight='bold', loc='left')
     ax.legend(loc='upper left', frameon=False, labelcolor='white')
     ax.grid(True, alpha=0.1)
+    
+    # X Ekseninde saatleri ve günleri düzgün gösterme
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
     fig.autofmt_xdate()
     plt.tight_layout()
@@ -195,7 +204,7 @@ if execute_scan:
         # Güvenli MultiIndex İndirme
         df_all = fetch_data_cached(yf_tickers, tf_config["period"], tf_config["interval"])
         
-        live_logs.append("[SYSTEM]: İndirme tamamlandı. Kuantitatif analiz başlıyor...")
+        live_logs.append(f"[SYSTEM]: İndirme tamamlandı. {selected_tf} periyodu için analiz başlıyor...")
         console_placeholder.code("\n".join(live_logs[-15:]))
         
         p_bar = st.progress(0)
@@ -216,6 +225,20 @@ if execute_scan:
                 console_placeholder.code("\n".join(live_logs[-15:]))
                 continue
                 
+            # SENTETİK MUM (RESAMPLING) MİMARİSİ
+            if tf_config["resample_rule"]:
+                try:
+                    df_symbol.index = pd.to_datetime(df_symbol.index)
+                    df_symbol = df_symbol.resample(tf_config["resample_rule"]).agg({
+                        'Open': 'first',
+                        'High': 'max',
+                        'Low': 'min',
+                        'Close': 'last',
+                        'Volume': 'sum'
+                    }).dropna()
+                except Exception:
+                    continue
+                
             if len(df_symbol) < 50:
                 continue
                 
@@ -226,7 +249,10 @@ if execute_scan:
                 console_placeholder.code("\n".join(live_logs[-15:]))
                 
                 curr_price = float(df_symbol['Close'].iloc[-1])
-                tv_url = f"https://www.tradingview.com/chart/?symbol={mkt_config['tv_prefix']}{symbol}"
+                # TradingView yönlendirmesi için timeframe eklemesi
+                tv_interval_map = {"1h": "60", "2h": "120", "4h": "240", "1d": "D", "1wk": "W"}
+                tv_interval = tv_interval_map.get(tf_config["resample_rule"] or tf_config["interval"], "D")
+                tv_url = f"https://www.tradingview.com/chart/?symbol={mkt_config['tv_prefix']}{symbol}&interval={tv_interval}"
                 
                 found_signals.append({
                     "Durum": ctx["type"],
@@ -240,7 +266,7 @@ if execute_scan:
                 stored_dfs[symbol] = {"df": df_symbol, "ctx": ctx}
         
         p_bar.empty()
-        st.markdown("<div style='color:#10b981; font-family:Inter; font-weight:600;'>[SİSTEM BİLGİSİ] Tarama işlemi başarıyla tamamlandı.</div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='color:#10b981; font-family:Inter; font-weight:600;'>[SİSTEM BİLGİSİ] {selected_tf} Taraması başarıyla tamamlandı.</div>", unsafe_allow_html=True)
         
         if found_signals:
             st.write("---")
@@ -256,4 +282,4 @@ if execute_scan:
             if selected_plot:
                 st.pyplot(draw_gz_chart(selected_plot, stored_dfs[selected_plot]["df"], stored_dfs[selected_plot]["ctx"]))
         else:
-            st.warning("Bu periyotta Altın Bölge kriterlerini karşılayan veya yaklaşan hisse bulunamadı.")
+            st.warning(f"Bu periyotta ({selected_tf}) Altın Bölge kriterlerini karşılayan veya yaklaşan hisse bulunamadı.")
