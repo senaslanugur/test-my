@@ -38,7 +38,7 @@ def get_all_market_symbols(mkt_config):
         "options": {"lang": "en"}, 
         "markets": [mkt_config['tv_market']],
         "symbols": {"query": {"types": []}, "tickers": []},
-        "columns": ["name", "market_cap_basic", "volume"],
+        "columns": ["name", "volume"],
         "sort": {"sortBy": "volume", "sortOrder": "desc"}, 
         "range": [0, 800] 
     }
@@ -51,155 +51,105 @@ def get_all_market_symbols(mkt_config):
     return []
 
 # ==========================================
-# 3. PINE SCRIPT ÇEKİRDEK ALGORİTMASI
+# 3. YENİ NESİL VEKTÖREL ALGORİTMA MOTORU
 # ==========================================
-def calculate_atr(high, low, close, period=14):
-    tr = np.maximum(high[1:] - low[1:], np.abs(high[1:] - close[:-1]))
-    tr = np.maximum(tr, np.abs(low[1:] - close[:-1]))
-    tr = np.insert(tr, 0, high[0] - low[0])
+def find_golden_zone_vectorized(df):
+    """
+    Kırılgan döngüler yerine, istatistiksel Swing High/Low noktalarını 
+    vektörel olarak bulan ve Golden Zone'u hesaplayan sağlam mimari.
+    """
+    highs = df['High'].values
+    lows = df['Low'].values
+    closes = df['Close'].values
+    opens = df['Open'].values
     
-    atr = np.zeros_like(tr)
-    atr[0] = tr[0]
-    alpha = 1.0 / period
-    for i in range(1, len(tr)):
-        atr[i] = alpha * tr[i] + (1 - alpha) * atr[i-1]
-    return atr
-
-def evaluate_golden_zone_pine_mimic(df, signal_window=3):
-    pivotLen = 15
-    confirmBars = 5
-    zzDevAtr = 1.5
-    invBufAtr = 0.3
-    goldenLower = 0.5
-    goldenUpper = 0.618
-    
-    high = df['High'].values
-    low = df['Low'].values
-    close = df['Close'].values
-    open_ = df['Open'].values
-    
-    atr = calculate_atr(high, low, close, 14)
-    N = len(high)
-    
-    zzP1, zzP0 = np.nan, np.nan
-    zzD1 = 0
-    zzLow, zzHigh = np.nan, np.nan
-    
-    aSet, aAlive = False, False
-    aHigh, aLow = np.nan, np.nan
-    gTop, gBot = np.nan, np.nan
-    aRejected = False
-    trailingStop = np.nan
-    
-    signal_triggered = False
-    signal_type = ""
-    bars_since_signal = 0
-    
-    if N < pivotLen + confirmBars:
+    pivots = []
+    # 15 bar geriye, 5 bar ileriye bakarak mutlak tepe ve dipleri bul
+    for i in range(15, len(df) - 5):
+        if highs[i] == np.max(highs[i-15 : i+6]):
+            pivots.append((i, 'H', highs[i]))
+        if lows[i] == np.min(lows[i-15 : i+6]):
+            pivots.append((i, 'L', lows[i]))
+            
+    if len(pivots) < 2: 
         return None
         
-    for i in range(pivotLen + confirmBars, N):
-        isZigZagHigh = False
-        isZigZagLow = False
-        zzLegEvent = False
-        
-        idx_eval = i - confirmBars
-        window_high = high[idx_eval - pivotLen : i + 1]
-        window_low = low[idx_eval - pivotLen : i + 1]
-        
-        usePH = np.nan
-        usePL = np.nan
-        
-        if high[idx_eval] == np.max(window_high): usePH = high[idx_eval]
-        if low[idx_eval] == np.min(window_low): usePL = low[idx_eval]
+    # Arka arkaya gelen aynı yönlü tepe/dipleri filtrele (ZigZag sadeliği)
+    zz = [pivots[0]]
+    for p in pivots[1:]:
+        last_p = zz[-1]
+        if p[1] == last_p[1]:
+            if p[1] == 'H' and p[2] > last_p[2]: zz[-1] = p
+            elif p[1] == 'L' and p[2] < last_p[2]: zz[-1] = p
+        else:
+            zz.append(p)
             
-        if not np.isnan(usePH) and not np.isnan(usePL):
-            if np.isnan(zzP1):
-                usePH = np.nan; usePL = np.nan
-            else:
-                dH = abs(usePH - zzP1); dL = abs(usePL - zzP1)
-                if dH > dL: usePL = np.nan
-                elif dL > dH: usePH = np.nan
-                else: usePH = np.nan; usePL = np.nan
+    if len(zz) < 2: 
+        return None
         
-        pivotAtr = atr[idx_eval] if not np.isnan(atr[idx_eval]) else 0
-        zzMinLeg = zzDevAtr * pivotAtr
+    last_pivot = zz[-1]
+    prev_pivot = zz[-2]
+    
+    # KURAL 1: Yükseliş yönlü (Bullish) bir yapı için, son oluşan pivot TEPE (High) olmalıdır.
+    if last_pivot[1] != 'H': 
+        return None
         
-        if not np.isnan(usePH):
-            if zzD1 == 1:
-                if usePH > zzP1: zzP1 = usePH; zzHigh = usePH; zzLegEvent = True; isZigZagHigh = True
-            elif np.isnan(zzP1): zzP1 = usePH; zzD1 = 1; zzHigh = usePH; isZigZagHigh = True
-            elif abs(usePH - zzP1) > zzMinLeg: zzP0 = zzP1; zzP1 = usePH; zzD1 = 1; zzHigh = usePH; zzLegEvent = True; isZigZagHigh = True
-                
-        if not np.isnan(usePL):
-            if zzD1 == -1:
-                if usePL < zzP1: zzP1 = usePL; zzLow = usePL; zzLegEvent = True; isZigZagLow = True
-            elif np.isnan(zzP1): zzP1 = usePL; zzD1 = -1; zzLow = usePL; isZigZagLow = True
-            elif abs(usePL - zzP1) > zzMinLeg: zzP0 = zzP1; zzP1 = usePL; zzD1 = -1; zzLow = usePL; zzLegEvent = True; isZigZagLow = True
-                
-        if isZigZagLow and not np.isnan(zzLow):
-            trailingStop = zzLow - (invBufAtr * atr[i])
-            
-        validLeg = (zzD1 != 0) and not np.isnan(zzP0) and not np.isnan(zzP1) and (zzP0 != zzP1)
-        dirBull = (zzD1 == 1)
-        legHigh = max(zzP0, zzP1) if validLeg else np.nan
-        legLow = min(zzP0, zzP1) if validLeg else np.nan
+    leg_high = last_pivot[2]
+    leg_low = prev_pivot[2]
+    
+    if leg_high <= leg_low: 
+        return None
         
-        validSetup = validLeg and (legHigh > legLow)
+    # KURAL 2: Fibonacci Bölgesi Hesaplama
+    rng = leg_high - leg_low
+    gz_upper = leg_high - (0.5 * rng)
+    gz_lower = leg_high - (0.618 * rng)
+    
+    # Son tepe oluştuktan sonraki fiyat hareketleri (Geri Çekilme Evresi)
+    pullback_bars = df.iloc[last_pivot[0] + 1 : ]
+    if pullback_bars.empty: 
+        return None
         
-        if zzLegEvent and validSetup:
-            aSet = True; aAlive = True
-            aHigh = legHigh; aLow = legLow
-            aRejected = False
-            
-            rng = aHigh - aLow
-            gTop = aHigh - (goldenLower * rng)
-            gBot = aHigh - (goldenUpper * rng)
-            
-        activeValid = aSet and aAlive and not np.isnan(aHigh) and not np.isnan(aLow) and (aHigh - aLow) > 0
-        evBullRej = False
-        inZoneWait = False
+    touched_zone = pullback_bars['Low'].min() <= gz_upper
+    
+    curr_close = closes[-1]
+    curr_low = lows[-1]
+    curr_open = opens[-1]
+    
+    signal = False
+    signal_type = ""
+    
+    # SİNYAL 1: Kusursuz Pine Script Ret İşlemi (Fitil atıp üstünde kapattı)
+    if curr_low <= gz_upper and curr_close > gz_upper and curr_close > curr_open:
+        signal = True
+        signal_type = "🎯 Kusursuz Ret (Bullish Rejection)"
         
-        if activeValid and dirBull:
-            touchWick = (low[i] <= gTop)
-            
-            # KURAL 1: Kusursuz Ret (Pine Script Orijinal)
-            bullRejectRaw = touchWick and (close[i] > gTop) and (close[i] > open_[i])
-            
-            # KURAL 2: Pusu Modu (Fiyat şu an Golden Zone içinde dinleniyor)
-            inZoneWait = (low[i] <= gTop) and (close[i] >= gBot) and (close[i] <= gTop)
-            
-            if bullRejectRaw and not aRejected:
-                aRejected = True
-                evBullRej = True
-                
-        longEnter = (evBullRej or isZigZagLow) and activeValid and dirBull
+    # SİNYAL 2: Radar/Pusu Modu (Fiyat şu an tam bölgenin içinde tepki bekliyor)
+    elif gz_lower <= curr_close <= gz_upper:
+        signal = True
+        signal_type = "⏳ Pusu Modu: Fiyat Altın Bölge İçinde"
         
-        # Sinyal Yakalama Penceresi (Son mumlar)
-        if i >= N - signal_window:
-            if longEnter:
-                signal_triggered = True
-                bars_since_signal = (N - 1) - i
-                signal_type = "🎯 Kusursuz Ret (Tam Alım)" if evBullRej else "📈 ZigZag Yeni Dip (Güvenli Alım)"
-            elif inZoneWait and i == N - 1 and not signal_triggered:
-                signal_triggered = True
-                bars_since_signal = 0
-                signal_type = "⏳ Pusu Modu: Fiyat Altın Bölge İçinde Tepki Bekliyor"
-
-    if signal_triggered:
-        tp_1618 = aHigh + (aHigh - aLow) * 0.618
-        if bars_since_signal > 0: signal_type += f" ({bars_since_signal} bar önce)"
-            
+    # SİNYAL 3: Güvenli Alım (Bölgeye değdi ve yukarı doğru kırılım başladı)
+    elif touched_zone and curr_close > gz_upper and curr_close > curr_open:
+        signal = True
+        signal_type = "🚀 Bölgeden Onaylı Çıkış"
+        
+    if signal:
+        tp_1618 = leg_high + (rng * 0.618)
+        # Zarar Kes (Stop Loss), başladığı yükseliş dibinin bir tık altıdır
+        stop_loss = leg_low * 0.99
+        
         return {
             "signal": True,
             "signal_type": signal_type,
-            "gz_lower": gBot,
-            "gz_upper": gTop,
+            "gz_lower": gz_lower,
+            "gz_upper": gz_upper,
             "tp": tp_1618,
-            "last_high": aHigh,
-            "last_low": aLow,
-            "stop_loss": trailingStop if not np.isnan(trailingStop) else aLow
+            "last_high": leg_high,
+            "last_low": leg_low,
+            "stop_loss": stop_loss
         }
+        
     return None
 
 def analyze_ticker(symbol, mkt_config, interval):
@@ -207,17 +157,20 @@ def analyze_ticker(symbol, mkt_config, interval):
     yf_ticker = f"{clean_symbol}{mkt_config['yf_suffix']}"
     
     try:
-        # Saatlik grafiklerde ZigZag'ın oluşabilmesi için veriyi 6 aya çıkardık
-        period = "6mo" if interval in ["1h", "90m"] else "2y"
+        # Yfinance veri limiti kuralları ihlal edilmeden en geniş veriyi çek
+        if interval in ["1h", "90m"]: period = "1mo"
+        elif interval == "1d": period = "1y"
+        else: period = "2y"
+        
         df = yf.download(tickers=yf_ticker, period=period, interval=interval, progress=False, show_errors=False)
         
-        if df.empty or len(df) < 60:
+        if df.empty or len(df) < 50:
             return None
             
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
             
-        result = evaluate_golden_zone_pine_mimic(df, signal_window=3)
+        result = find_golden_zone_vectorized(df)
         if result and result["signal"]:
             result["ticker"] = symbol
             result["df"] = df
@@ -234,23 +187,17 @@ def plot_setup(result):
     df = result["df"]
     ticker = result["ticker"]
     
-    plot_df = df.iloc[-120:].copy()
+    plot_df = df.iloc[-90:].copy()
     plot_df.reset_index(inplace=True)
     
     fig, ax = plt.subplots(figsize=(14, 6))
     
-    # Mum Kapanış Çizgisi
     sns.lineplot(data=plot_df, x=plot_df.index, y='Close', color='#00E676', linewidth=2.5, ax=ax)
-    
-    # Altın Bölge (Golden Zone)
     ax.axhspan(result["gz_lower"], result["gz_upper"], color='#388E3C', alpha=0.35, label='Altın Bölge (0.5 - 0.618)')
-    
-    # Projeksiyon ve Risk Seviyeleri
     ax.axhline(result["tp"], color='#FFD600', linestyle='--', linewidth=1.5, label='Kâr Al (1.618)')
-    ax.axhline(result["stop_loss"], color='#D32F2F', linestyle='-.', linewidth=2, label='ATR İzleyen Stop (Trailing)')
+    ax.axhline(result["stop_loss"], color='#D32F2F', linestyle='-.', linewidth=2, label='Stop Loss (Ana Dip)')
     ax.axhline(result["last_high"], color='#9E9E9E', linestyle=':', linewidth=1, alpha=0.5, label='Son Zirve (Fib 0)')
     
-    # Metin ve Estetik Ayarları
     ax.set_title(f"{ticker} | Durum: {result['signal_type']}", color='white', fontsize=14, fontweight='bold', pad=15)
     ax.set_xlabel("Zaman (Son Barlar)", color='lightgray')
     ax.set_ylabel("Fiyat", color='lightgray')
@@ -269,7 +216,7 @@ def plot_setup(result):
 # 5. STREAMLIT ARAYÜZ MİMARİSİ
 # ==========================================
 st.title("🦅 HexaTrades Golden Zone Kuantitatif Tarayıcı")
-st.markdown("Piyasadaki hacimli hisseler anlık olarak taranır. Sistem, **tam alım noktasında olanları** ve **Altın Bölge'de pusuya yatanları** listeler.")
+st.markdown("Piyasadaki hacimli hisseler taranır. Sistem, **Altın Bölge'de olanları** listeler.")
 st.markdown("---")
 
 col1, col2 = st.columns([1, 3])
@@ -292,7 +239,7 @@ with col2:
             st.error("Bağlantı hatası: TradingView'den hisse listesi alınamadı.")
             st.stop()
             
-        st.success(f"Başarılı! Hacme göre en iyi **{len(tv_symbols)}** hisse analiz ediliyor. İşlem sürüyor...")
+        st.success(f"Başarılı! Toplam **{len(tv_symbols)}** hisse analiz ediliyor. İşlem sürüyor...")
         
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -321,7 +268,6 @@ with col2:
         if not signals:
             st.warning("Seçilen periyotta Altın Bölge kriterlerini karşılayan hisse bulunamadı. Lütfen zaman periyodunu değiştirerek tekrar deneyin.")
         else:
-            # Sinyal tipine göre sırala (Tam red yiyenler en üstte)
             signals.sort(key=lambda x: "Pusu" in x["signal_type"])
             
             st.success(f"🎯 Toplam **{len(signals)}** adet hissede Golden Zone fırsatı tespit edildi!")
@@ -332,7 +278,6 @@ with col2:
                 tp_p = float(res["tp"])
                 kar_potansiyeli = ((tp_p - current_p) / current_p) * 100
                 
-                # Emoji ve başlık dinamiği
                 is_pusu = "Pusu" in res['signal_type']
                 icon = "⏳" if is_pusu else "🟢"
                 
@@ -344,7 +289,7 @@ with col2:
                     with col_info:
                         st.markdown(f"**Durum:** {res['signal_type']}")
                         st.markdown(f"**Giriş Bandı:** {res['gz_lower']:.2f} - {res['gz_upper']:.2f}")
-                        st.markdown(f"**Stop (ATR):** {res['stop_loss']:.2f}")
+                        st.markdown(f"**Stop (Dip):** {res['stop_loss']:.2f}")
                         st.markdown(f"[📊 TradingView'da Aç]({tv_link})")
                         
                     with col_chart:
