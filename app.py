@@ -2,13 +2,12 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
+import matplotlib.subplots as plt_subplots
 import matplotlib.dates as mdates
 import seaborn as sns
 import requests
 import warnings
 
-# Yfinance uyarılarını terminalde gizle
 warnings.filterwarnings("ignore")
 
 # =============================================================================
@@ -35,8 +34,6 @@ MARKET_CONFIGS = {
     "Amerika (ABD)": {"tv_market": "america", "yf_suffix": "", "tv_prefix": ""}
 }
 
-# yfinance için 2h ve 4h periyotları doğrudan stabil değildir.
-# Bu yüzden 1h verisi çekilip Pandas ile Sentetik (Resample) Mum oluşturulur.
 TIMEFRAME_CONFIGS = {
     "1 Saatlik (1H)": {"interval": "1h", "period": "6mo", "resample_rule": None},
     "2 Saatlik (2H)": {"interval": "1h", "period": "6mo", "resample_rule": "2h"},
@@ -46,7 +43,7 @@ TIMEFRAME_CONFIGS = {
 }
 
 # =============================================================================
-# 3. VERİ ÇEKME MOTORU (ÇÖKMEZ MİMARİ)
+# 3. VERİ ÇEKME MOTORU
 # =============================================================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_all_market_symbols(mkt_config):
@@ -69,116 +66,180 @@ def get_all_market_symbols(mkt_config):
 
 @st.cache_data(ttl=900, show_spinner=False) 
 def fetch_data_cached(tickers, period, interval):
-    """Veriyi MultiIndex formatında toplu olarak güvenle indirir."""
     return yf.download(tickers=tickers, period=period, interval=interval, group_by="ticker", threads=True, progress=False)
 
 # =============================================================================
-# 4. KANTİTATİF ALGORİTMA: HİBRİT PINE SCRIPT MİMARİSİ
+# 4. KANTİTATİF ALGORİTMA: STATE MACHINE (DURUM HAFIZALI) PINE MİMARİSİ
 # =============================================================================
-def evaluate_golden_zone(df, signal_window=5):
+def evaluate_golden_zone_state_machine(df, signal_window=5):
+    pivotLen = 15
+    confirmBars = 5
+    zzDevAtr = 1.5
+    invBufAtr = 0.3
+    goldenLower = 0.5
+    goldenUpper = 0.618
+    
     highs = df['High'].values
     lows = df['Low'].values
     closes = df['Close'].values
     opens = df['Open'].values
     
-    # Pine Script ATR Hesaplaması (Gürültü Filtresi İçin)
+    # ATR (RMA) Hesaplaması
     tr = np.maximum(highs[1:] - lows[1:], np.abs(highs[1:] - closes[:-1]))
     tr = np.maximum(tr, np.abs(lows[1:] - closes[:-1]))
     tr = np.insert(tr, 0, highs[0] - lows[0])
-    
     atr = np.zeros_like(tr)
     atr[0] = tr[0]
+    alpha = 1.0 / 14
     for i in range(1, len(tr)):
-        atr[i] = (1/14) * tr[i] + (1 - 1/14) * atr[i-1]
-
-    pivots = []
-    # Pivot Tespiti (15 bar geriye, 5 bar ileriye)
-    for i in range(15, len(df) - 5):
-        if highs[i] == np.max(highs[i-15 : i+6]):
-            pivots.append({'idx': i, 'type': 'H', 'val': highs[i], 'conf_idx': i + 5})
-        if lows[i] == np.min(lows[i-15 : i+6]):
-            pivots.append({'idx': i, 'type': 'L', 'val': lows[i], 'conf_idx': i + 5})
-            
-    if len(pivots) < 2: 
+        atr[i] = alpha * tr[i] + (1 - alpha) * atr[i-1]
+        
+    N = len(highs)
+    if N < pivotLen + confirmBars:
         return False, None
         
-    # ZigZag Filtrelemesi
-    zz = [pivots[0]]
-    for p in pivots[1:]:
-        last_p = zz[-1]
-        if p['type'] == last_p['type']:
-            if p['type'] == 'H' and p['val'] > last_p['val']: zz[-1] = p
-            elif p['type'] == 'L' and p['val'] < last_p['val']: zz[-1] = p
+    zzP1 = np.nan; zzP0 = np.nan
+    zzD1 = 0
+    zzLow = np.nan; zzHigh = np.nan
+    
+    aSet = False; aAlive = False
+    aHigh = np.nan; aLow = np.nan
+    gTop = np.nan; gBot = np.nan
+    aRejected = False
+    
+    trailing_stop = np.nan
+    in_position = False  # Portföy Durum Hafızası (Sanal İşlem)
+    
+    signal_triggered = False
+    signal_data = {}
+    
+    for i in range(pivotLen + confirmBars, N):
+        isZigZagHigh = False
+        isZigZagLow = False
+        zzLegEvent = False
+        
+        idx_eval = i - confirmBars
+        window_high = highs[idx_eval - pivotLen : i + 1]
+        window_low = lows[idx_eval - pivotLen : i + 1]
+        
+        usePH = np.nan; usePL = np.nan
+        if highs[idx_eval] == np.max(window_high): usePH = highs[idx_eval]
+        if lows[idx_eval] == np.min(window_low): usePL = lows[idx_eval]
+            
+        if not np.isnan(usePH) and not np.isnan(usePL):
+            if np.isnan(zzP1):
+                usePH = np.nan; usePL = np.nan
+            else:
+                dH = abs(usePH - zzP1); dL = abs(usePL - zzP1)
+                if dH > dL: usePL = np.nan
+                elif dL > dH: usePH = np.nan
+                else: usePH = np.nan; usePL = np.nan
+        
+        pivotAtr = atr[idx_eval] if not np.isnan(atr[idx_eval]) else 0
+        zzMinLeg = zzDevAtr * pivotAtr
+        
+        if not np.isnan(usePH):
+            if zzD1 == 1:
+                if usePH > zzP1: zzP1 = usePH; zzHigh = usePH; zzLegEvent = True; isZigZagHigh = True
+            elif np.isnan(zzP1): zzP1 = usePH; zzD1 = 1; zzHigh = usePH; isZigZagHigh = True
+            elif abs(usePH - zzP1) > zzMinLeg: zzP0 = zzP1; zzP1 = usePH; zzD1 = 1; zzHigh = usePH; zzLegEvent = True; isZigZagHigh = True
+                
+        if not np.isnan(usePL):
+            if zzD1 == -1:
+                if usePL < zzP1: zzP1 = usePL; zzLow = usePL; zzLegEvent = True; isZigZagLow = True
+            elif np.isnan(zzP1): zzP1 = usePL; zzD1 = -1; zzLow = usePL; isZigZagLow = True
+            elif abs(usePL - zzP1) > zzMinLeg: zzP0 = zzP1; zzP1 = usePL; zzD1 = -1; zzLow = usePL; zzLegEvent = True; isZigZagLow = True
+                
+        # ATR Trailing Stop Güncellemesi (Sadece dip oluştuğunda)
+        if isZigZagLow and not np.isnan(zzLow):
+            trailing_stop = zzLow - (invBufAtr * atr[i])
+            
+        validLeg = (zzD1 != 0) and not np.isnan(zzP0) and not np.isnan(zzP1) and (zzP0 != zzP1)
+        dirBull = (zzD1 == 1)
+        legHigh = max(zzP0, zzP1) if validLeg else np.nan
+        legLow = min(zzP0, zzP1) if validLeg else np.nan
+        
+        validSetup = validLeg and (legHigh > legLow)
+        
+        if zzLegEvent and validSetup:
+            aSet = True; aAlive = True
+            aHigh = legHigh; aLow = legLow
+            aRejected = False
+            rng = aHigh - aLow
+            gTop = aHigh - (goldenLower * rng)
+            gBot = aHigh - (goldenUpper * rng)
+            
+        activeValid = aSet and aAlive and not np.isnan(aHigh) and not np.isnan(aLow) and (aHigh - aLow) > 0
+        evBullRej = False
+        
+        if activeValid and dirBull:
+            touchWick = (lows[i] <= gTop)
+            bullRejectRaw = touchWick and (closes[i] > gTop) and (closes[i] > opens[i])
+            if bullRejectRaw and not aRejected:
+                aRejected = True
+                evBullRej = True
+                
+        longEnter = (evBullRej or isZigZagLow) and activeValid and dirBull
+        longExit = (not np.isnan(trailing_stop)) and (closes[i] < trailing_stop)
+        
+        # --- DURUM MAKİNESİ (Sanal Portföy & Pine Script İşlem Yönetimi) ---
+        current_bar_signal = None
+        
+        if in_position:
+            if longExit:
+                in_position = False
+                trailing_stop = np.nan # Stop patladı, satıldı
+                current_bar_signal = "Sat (Trend Bozuldu)"
+            elif longEnter:
+                current_bar_signal = "📈 Trend İçi Ekleme (Zaten Al'da)"
         else:
-            zz.append(p)
-            
-    if len(zz) < 2: 
-        return False, None
+            if longEnter:
+                in_position = True
+                if evBullRej:
+                    current_bar_signal = "🎯 Taze Alım (Kusursuz Ret)"
+                elif isZigZagLow:
+                    current_bar_signal = "🔥 Taze Alım (Trend/Dip Onayı)"
         
-    last_pivot = zz[-1]
-    prev_pivot = zz[-2]
-    
-    # Golden Zone Kurulumu (Son bacak yükseliş olmalı veya son oluşan pivot dip olmalı)
-    if last_pivot['type'] == 'H':
-        leg_high = last_pivot['val']
-        leg_low = prev_pivot['val']
-    else:
-        leg_high = prev_pivot['val']
-        leg_low = last_pivot['val']
-        
-    if leg_high <= leg_low: 
-        return False, None
-        
-    rng = leg_high - leg_low
-    gz_upper = leg_high - (0.5 * rng)
-    gz_lower = leg_high - (0.618 * rng)
-    
-    curr_close = closes[-1]
-    curr_low = lows[-1]
-    curr_open = opens[-1]
-    
-    signal = False
-    signal_type = ""
-    dist_pct = (curr_close - gz_upper) / gz_upper
-    
-    # SİNYAL 1: PINE SCRIPT "AL (TREND/DİP)" TEYİT YAKALAYICI
-    current_bar_idx = len(df) - 1
-    
-    if last_pivot['type'] == 'L':
-        # Dibin onaylanma barı (conf_idx), son 'signal_window' içine düşüyorsa
-        if (current_bar_idx - signal_window) <= last_pivot['conf_idx'] <= current_bar_idx:
-            # ATR Filtresi
-            min_leg_required = 1.5 * atr[last_pivot['conf_idx']]
-            bounce_distance = closes[last_pivot['conf_idx']] - last_pivot['val']
-            
-            if bounce_distance >= min_leg_required:
-                signal = True
-                signal_type = "🔥 Al (Trend/Dip) Onayı Geldi!"
-    
-    # SİNYAL 2: Kusursuz Ret
-    if not signal and (curr_low <= gz_upper and curr_close > gz_upper and curr_close > curr_open):
-        signal = True
-        signal_type = "🎯 Kusursuz Ret (Tam Alım)"
-        
-    # SİNYAL 3: Pusu Modu
-    elif not signal and (gz_lower <= curr_close <= gz_upper):
-        signal = True
-        signal_type = "⏳ Pusu Modu (Bölge İçi Bekleyiş)"
-        
-    # SİNYAL 4: Yaklaşanlar
-    elif not signal and (0 < dist_pct <= 0.025):
-        signal = True
-        signal_type = f"👀 Yaklaşıyor (+%{dist_pct*100:.1f})"
-        
-    if signal:
-        return True, {
-            "type": signal_type, 
-            "gz_lower": gz_lower, 
-            "gz_upper": gz_upper,
-            "tp": leg_high + (rng * 0.618), 
-            "last_high": leg_high, 
-            "stop": leg_low * 0.99
-        }
+        # Sinyal Penceresi Taraması
+        if i >= N - signal_window:
+            if current_bar_signal and "Sat" not in current_bar_signal:
+                signal_triggered = True
+                bars_ago = (N - 1) - i
+                ext = f" ({bars_ago} bar önce)" if bars_ago > 0 else ""
+                
+                signal_data = {
+                    "type": current_bar_signal + ext,
+                    "gz_lower": gBot, "gz_upper": gTop,
+                    "tp": aHigh + ((aHigh - aLow) * 0.618),
+                    "last_high": aHigh,
+                    "stop": trailing_stop if not np.isnan(trailing_stop) else aLow
+                }
+                
+    # O ANKİ bar için Pusu veya Yaklaşma durumu (Sadece Nakitteysek geçerli)
+    if not signal_triggered and activeValid and dirBull and not in_position:
+        curr_close = closes[-1]
+        dist_pct = (curr_close - gTop) / gTop
+        if gBot <= curr_close <= gTop:
+            signal_triggered = True
+            signal_data = {
+                "type": "⏳ Pusu Modu (Nakitte, Bölge İçi Bekleyiş)",
+                "gz_lower": gBot, "gz_upper": gTop,
+                "tp": aHigh + ((aHigh - aLow) * 0.618),
+                "last_high": aHigh,
+                "stop": trailing_stop if not np.isnan(trailing_stop) else aLow
+            }
+        elif 0 < dist_pct <= 0.025:
+            signal_triggered = True
+            signal_data = {
+                "type": f"👀 Yaklaşıyor (+%{dist_pct*100:.1f}) (Nakitte)",
+                "gz_lower": gBot, "gz_upper": gTop,
+                "tp": aHigh + ((aHigh - aLow) * 0.618),
+                "last_high": aHigh,
+                "stop": trailing_stop if not np.isnan(trailing_stop) else aLow
+            }
+
+    if signal_triggered:
+        return True, signal_data
         
     return False, None
 
@@ -187,23 +248,24 @@ def evaluate_golden_zone(df, signal_window=5):
 # =============================================================================
 def draw_gz_chart(symbol, df, ctx):
     plot_df = df.tail(100).copy()
-    plt.style.use('dark_background')
-    fig, ax = plt.subplots(figsize=(12, 6))
+    plt_subplots.style.use('dark_background')
+    fig, ax = plt_subplots.subplots(figsize=(12, 6))
     
     up = plot_df['Close'] >= plot_df['Open']
     down = plot_df['Close'] < plot_df['Open']
     width = 0.6
     
-    # Profesyonel Mum Grafiği
     ax.bar(plot_df.index[up], plot_df['Close'][up] - plot_df['Open'][up], width, bottom=plot_df['Open'][up], color='#10b981')
     ax.bar(plot_df.index[down], plot_df['Open'][down] - plot_df['Close'][down], width, bottom=plot_df['Close'][down], color='#ef4444')
     ax.vlines(plot_df.index[up], plot_df['Low'][up], plot_df['High'][up], color='#10b981', linewidth=1)
     ax.vlines(plot_df.index[down], plot_df['Low'][down], plot_df['High'][down], color='#ef4444', linewidth=1)
     
-    # Golden Zone Çizgileri
     ax.axhspan(ctx["gz_lower"], ctx["gz_upper"], color='#f59e0b', alpha=0.2, label='Altın Bölge (Golden Pocket)')
     ax.axhline(ctx["tp"], color='#00ffff', linestyle='--', linewidth=1.5, label='Kâr Al (1.618 Projeksiyon)')
-    ax.axhline(ctx["stop"], color='#ef4444', linestyle=':', linewidth=2, label='Stop Loss (Ana Dip)')
+    
+    if not np.isnan(ctx["stop"]):
+        ax.axhline(ctx["stop"], color='#ef4444', linestyle=':', linewidth=2.5, label='ATR İzleyen Stop Loss')
+        
     ax.axhline(ctx["last_high"], color='#9ca3af', linestyle='-', linewidth=1, alpha=0.5, label='Son Zirve')
     
     ax.set_title(f"{symbol} | DURUM: {ctx['type']}", color='#e5e7eb', fontsize=12, fontweight='bold', loc='left')
@@ -212,7 +274,7 @@ def draw_gz_chart(symbol, df, ctx):
     
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
     fig.autofmt_xdate()
-    plt.tight_layout()
+    plt_subplots.tight_layout()
     return fig
 
 # =============================================================================
@@ -247,10 +309,9 @@ if execute_scan:
         live_logs.append(f"[SYSTEM]: {len(market_symbols)} hissenin verisi tek pakette indiriliyor...")
         console_placeholder.code("\n".join(live_logs[-15:]))
         
-        # Güvenli MultiIndex İndirme
         df_all = fetch_data_cached(yf_tickers, tf_config["period"], tf_config["interval"])
         
-        live_logs.append(f"[SYSTEM]: İndirme tamamlandı. {selected_tf} periyodu için analiz başlıyor...")
+        live_logs.append(f"[SYSTEM]: İndirme tamamlandı. {selected_tf} periyodu için durum makinesi analiz başlıyor...")
         console_placeholder.code("\n".join(live_logs[-15:]))
         
         p_bar = st.progress(0)
@@ -261,7 +322,6 @@ if execute_scan:
             p_bar.progress((idx + 1) / len(market_symbols))
             yf_ticker_key = f"{symbol.replace('.', '-')}{mkt_config['yf_suffix']}"
             
-            # Hata Engelleyici Mimari (hasattr kontrolü)
             if hasattr(df_all.columns, 'levels') and yf_ticker_key in df_all.columns.levels[0]:
                 df_symbol = df_all[yf_ticker_key].dropna(subset=['High', 'Close', 'Low', 'Open']).copy()
             elif len(yf_tickers) == 1:
@@ -271,16 +331,11 @@ if execute_scan:
                 console_placeholder.code("\n".join(live_logs[-15:]))
                 continue
                 
-            # SENTETİK MUM (RESAMPLING) MİMARİSİ
             if tf_config["resample_rule"]:
                 try:
                     df_symbol.index = pd.to_datetime(df_symbol.index)
                     df_symbol = df_symbol.resample(tf_config["resample_rule"]).agg({
-                        'Open': 'first',
-                        'High': 'max',
-                        'Low': 'min',
-                        'Close': 'last',
-                        'Volume': 'sum'
+                        'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
                     }).dropna()
                 except Exception:
                     continue
@@ -288,10 +343,11 @@ if execute_scan:
             if len(df_symbol) < 50:
                 continue
                 
-            is_setup, ctx = evaluate_golden_zone(df_symbol)
+            is_setup, ctx = evaluate_golden_zone_state_machine(df_symbol)
             
             if is_setup:
-                live_logs.append(f"[BULL] {symbol:<6} : {ctx['type']}")
+                # Loglara sade halini bas
+                live_logs.append(f"[MATCH] {symbol:<6} : {ctx['type'].split('(')[0].strip()}")
                 console_placeholder.code("\n".join(live_logs[-15:]))
                 
                 curr_price = float(df_symbol['Close'].iloc[-1])
@@ -315,9 +371,10 @@ if execute_scan:
         
         if found_signals:
             st.write("---")
-            st.write(f"### 🏆 ONAYLANMIŞ FIRSATLAR ({selected_tf})")
+            st.write(f"### 🏆 ONAYLANMIŞ FIRSATLAR VE DURUMLAR ({selected_tf})")
             
-            res_df = pd.DataFrame(found_signals).sort_values(by="Durum")
+            # Taze alımları en üste alacak şekilde basit sıralama
+            res_df = pd.DataFrame(found_signals).sort_values(by="Durum", ascending=False)
             st.dataframe(res_df, use_container_width=True, hide_index=True,
                          column_config={"Bağlantı": st.column_config.LinkColumn("TradingView", display_text="Grafiği Aç")})
             
@@ -327,4 +384,4 @@ if execute_scan:
             if selected_plot:
                 st.pyplot(draw_gz_chart(selected_plot, stored_dfs[selected_plot]["df"], stored_dfs[selected_plot]["ctx"]))
         else:
-            st.warning(f"Bu periyotta ({selected_tf}) Altın Bölge kriterlerini karşılayan veya yaklaşan hisse bulunamadı.")
+            st.warning(f"Bu periyotta ({selected_tf}) tespit edilen aktif bir durum bulunamadı.")
