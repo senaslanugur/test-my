@@ -1,3 +1,4 @@
+
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -39,7 +40,7 @@ MARKET_CONFIGS = {
 }
 
 TIMEFRAME_CONFIGS = {
-    "1 Saatlik (1H)": {"interval": "1h", "period": "730d", "resample_rule": None}, # yf limit for 1h is 730 days
+    "1 Saatlik (1H)": {"interval": "1h", "period": "730d", "resample_rule": None},
     "2 Saatlik (2H)": {"interval": "1h", "period": "730d", "resample_rule": "2h"},
     "4 Saatlik (4H)": {"interval": "1h", "period": "730d", "resample_rule": "4h"},
     "1 Günlük (1D)": {"interval": "1d", "period": "max", "resample_rule": None},
@@ -47,7 +48,7 @@ TIMEFRAME_CONFIGS = {
 }
 
 # =============================================================================
-# 3. VERİ ÇEKME MOTORU
+# 3. VERİ ÇEKME MOTORU VE OTONOM TARİH BULUCU
 # =============================================================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_all_market_symbols(mkt_config):
@@ -70,17 +71,35 @@ def get_all_market_symbols(mkt_config):
 
 @st.cache_data(ttl=900, show_spinner=False) 
 def fetch_data_cached(tickers, period, interval):
-    return yf.download(tickers=tickers, period=period, interval=interval, group_by="ticker", threads=True, progress=False)
+    return yf.download(tickers=tickers, period=period, interval=interval, group_by="ticker", threads=True, progress=False, show_errors=False)
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_single_historical_data(ticker, interval, start_date, end_date):
-    return yf.download(ticker, start=start_date, end=end_date, interval=interval, progress=False)
+    return yf.download(ticker, start=start_date, end=end_date, interval=interval, progress=False, show_errors=False)
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_first_available_date(ticker, interval):
+    """Seçilen hissenin API'deki en eski verisini otomatik olarak bulur."""
+    try:
+        # Eğer saatlik veriyse, yfinance limiti gereği en fazla 729 gün geriye gidebiliriz.
+        if interval == "1h":
+            return datetime.today().date() - timedelta(days=725)
+            
+        hist = yf.download(ticker, period="max", interval="1d", progress=False, show_errors=False)
+        if not hist.empty:
+            return hist.index.min().date()
+    except Exception:
+        pass
+    return datetime.today().date() - timedelta(days=365)
 
 # =============================================================================
-# 4. KANTİTATİF ALGORİTMA: STATE MACHINE (ORTAK ÇEKİRDEK)
+# 4. KANTİTATİF ALGORİTMA: STATE MACHINE (PINE SCRIPT BİREBİR)
 # =============================================================================
 def core_pine_state_machine(df):
-    """Hem tarayıcı hem de backtest için çalışan saf Pine Script çekirdeği."""
+    """
+    Kusursuz Ret (evBullRej) ve Trend Dip (isZigZagLow) mantıklarını 
+    Pine Script (v6) yapısıyla %100 eşzamanlı çalıştıran çekirdek.
+    """
     pivotLen, confirmBars, zzDevAtr, invBufAtr = 15, 5, 1.5, 0.3
     goldenLower, goldenUpper = 0.5, 0.618
     
@@ -88,6 +107,7 @@ def core_pine_state_machine(df):
     closes, opens = df['Close'].values, df['Open'].values
     dates = df.index
     
+    # ATR (RMA) Hesaplaması
     tr = np.maximum(highs[1:] - lows[1:], np.abs(highs[1:] - closes[:-1]))
     tr = np.maximum(tr, np.abs(lows[1:] - closes[:-1]))
     tr = np.insert(tr, 0, highs[0] - lows[0])
@@ -98,14 +118,12 @@ def core_pine_state_machine(df):
     N = len(highs)
     
     zzP1, zzP0, zzD1, zzLow, zzHigh = np.nan, np.nan, 0, np.nan, np.nan
-    aSet, aAlive, aHigh, aLow, gTop, gBot, aRejected = False, False, np.nan, np.nan, np.nan, np.nan, False
+    aSet, aAlive, aBull, aHigh, aLow, gTop, gBot, aRejected = False, False, False, np.nan, np.nan, np.nan, np.nan, False
     trailing_stop = np.nan
     in_position = False
     
     trades = []
     entry_price, entry_date, entry_type = 0, None, ""
-    
-    # Tarayıcı için son durum
     latest_state = {"signal": False, "data": None}
     
     for i in range(pivotLen + confirmBars, N):
@@ -143,24 +161,29 @@ def core_pine_state_machine(df):
             
         validLeg = (zzD1 != 0) and not np.isnan(zzP0) and not np.isnan(zzP1) and (zzP0 != zzP1)
         dirBull = (zzD1 == 1)
+        
         legHigh = max(zzP0, zzP1) if validLeg else np.nan
         legLow = min(zzP0, zzP1) if validLeg else np.nan
         
         if zzLegEvent and (validLeg and (legHigh > legLow)):
-            aSet, aAlive, aHigh, aLow, aRejected = True, True, legHigh, legLow, False
-            gTop, gBot = aHigh - (goldenLower * (aHigh - aLow)), aHigh - (goldenUpper * (aHigh - aLow))
+            aSet, aAlive, aBull, aHigh, aLow, aRejected = True, True, dirBull, legHigh, legLow, False
+            rng = aHigh - aLow
+            gTop = aHigh - (goldenLower * rng)
+            gBot = aHigh - (goldenUpper * rng)
             
         activeValid = aSet and aAlive and not np.isnan(aHigh) and not np.isnan(aLow) and (aHigh - aLow) > 0
         evBullRej = False
         
-        if activeValid and dirBull:
+        # SADECE Bullish bacaklarda Kusursuz Ret onayı
+        if activeValid and aBull:
             if (lows[i] <= gTop) and (closes[i] > gTop) and (closes[i] > opens[i]) and not aRejected:
                 aRejected = True; evBullRej = True
                 
-        longEnter = (evBullRej or isZigZagLow) and activeValid and dirBull
+        # PINE SCRIPT TAM EŞLEŞME: Ret yediğinde VEYA Dip onaylandığında (Trend/Dip)
+        longEnter = evBullRej or isZigZagLow
         longExit = (not np.isnan(trailing_stop)) and (closes[i] < trailing_stop)
         
-        # --- İŞLEM YÖNETİMİ (BACKTEST İÇİN) ---
+        # --- İŞLEM YÖNETİMİ (BACKTEST) ---
         if in_position:
             if longExit:
                 in_position = False
@@ -175,10 +198,10 @@ def core_pine_state_machine(df):
             if longEnter:
                 in_position = True
                 entry_price, entry_date = closes[i], dates[i]
-                entry_type = "Kusursuz Ret" if evBullRej else "Trend/Dip Onayı"
+                entry_type = "🎯 Kusursuz Ret" if evBullRej else "🔥 Trend/Dip Onayı"
                 
         # --- TARAYICI (SCANNER) DURUM GÜNCELLEMESİ ---
-        if i >= N - 5: # Son 5 bar sinyal penceresi
+        if i >= N - 5: 
             current_bar_signal = None
             if in_position and longEnter and i == N-1: current_bar_signal = "📈 Trend İçi Ekleme"
             elif not in_position and longEnter: current_bar_signal = "🎯 Taze Alım (Kusursuz Ret)" if evBullRej else "🔥 Taze Alım (Trend/Dip Onayı)"
@@ -196,7 +219,7 @@ def core_pine_state_machine(df):
                 }
                 
     # Nakitteysek Pusu/Yaklaşma Kontrolü (Son bar)
-    if not latest_state["signal"] and activeValid and dirBull and not in_position:
+    if not latest_state["signal"] and activeValid and aBull and not in_position:
         curr_close = closes[-1]
         dist_pct = (curr_close - gTop) / gTop
         if gBot <= curr_close <= gTop:
@@ -211,8 +234,8 @@ def core_pine_state_machine(df):
 # =============================================================================
 def draw_gz_chart(symbol, df, ctx):
     plot_df = df.tail(100).copy()
-    plt.style.use('dark_background')
-    fig, ax = plt.subplots(figsize=(12, 6))
+    plt_subplots.style.use('dark_background')
+    fig, ax = plt_subplots.subplots(figsize=(12, 6))
     
     up, down = plot_df['Close'] >= plot_df['Open'], plot_df['Close'] < plot_df['Open']
     ax.bar(plot_df.index[up], plot_df['Close'][up] - plot_df['Open'][up], 0.6, bottom=plot_df['Open'][up], color='#10b981')
@@ -220,8 +243,10 @@ def draw_gz_chart(symbol, df, ctx):
     ax.vlines(plot_df.index[up], plot_df['Low'][up], plot_df['High'][up], color='#10b981', linewidth=1)
     ax.vlines(plot_df.index[down], plot_df['Low'][down], plot_df['High'][down], color='#ef4444', linewidth=1)
     
-    ax.axhspan(ctx["gz_lower"], ctx["gz_upper"], color='#f59e0b', alpha=0.2, label='Altın Bölge (Golden Pocket)')
-    ax.axhline(ctx["tp"], color='#00ffff', linestyle='--', linewidth=1.5, label='Kâr Al (1.618 Projeksiyon)')
+    if not np.isnan(ctx["gz_lower"]):
+        ax.axhspan(ctx["gz_lower"], ctx["gz_upper"], color='#f59e0b', alpha=0.2, label='Altın Bölge (Golden Pocket)')
+        ax.axhline(ctx["tp"], color='#00ffff', linestyle='--', linewidth=1.5, label='Kâr Al (1.618 Projeksiyon)')
+    
     if not np.isnan(ctx["stop"]): ax.axhline(ctx["stop"], color='#ef4444', linestyle=':', linewidth=2.5, label='ATR İzleyen Stop Loss')
         
     ax.set_title(f"{symbol} | DURUM: {ctx['type']}", color='#e5e7eb', fontsize=12, fontweight='bold', loc='left')
@@ -229,19 +254,16 @@ def draw_gz_chart(symbol, df, ctx):
     ax.grid(True, alpha=0.1)
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
     fig.autofmt_xdate()
-    plt.tight_layout()
+    plt_subplots.tight_layout()
     return fig
 
 def draw_equity_curve(trades_df):
-    plt.style.use('dark_background')
-    fig, ax = plt.subplots(figsize=(14, 5))
+    plt_subplots.style.use('dark_background')
+    fig, ax = plt_subplots.subplots(figsize=(14, 5))
     
     trades_df['Kümülatif Getiri (%)'] = trades_df['Kâr/Zarar (%)'].cumsum()
     
-    # Sıfır çizgisi
     ax.axhline(0, color='#ffffff', linestyle='-', alpha=0.3)
-    
-    # Özsermaye eğrisi
     color = '#10b981' if trades_df['Kümülatif Getiri (%)'].iloc[-1] >= 0 else '#ef4444'
     ax.plot(trades_df['Çıkış Tarihi'], trades_df['Kümülatif Getiri (%)'], color=color, linewidth=2.5, marker='o', markersize=5)
     ax.fill_between(trades_df['Çıkış Tarihi'], trades_df['Kümülatif Getiri (%)'], 0, color=color, alpha=0.15)
@@ -251,7 +273,7 @@ def draw_equity_curve(trades_df):
     ax.grid(True, alpha=0.1)
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
     fig.autofmt_xdate()
-    plt.tight_layout()
+    plt_subplots.tight_layout()
     return fig
 
 # =============================================================================
@@ -359,7 +381,7 @@ with tab_backtest:
     st.markdown("""
         <div style='background-color:#111827; padding:15px; border-left:4px solid #f59e0b; margin-bottom:20px;'>
             <div style='color:#e5e7eb; font-weight:600; font-size:14px; margin-bottom:5px;'>Kuantitatif Performans Laboratuvarı</div>
-            <div style='color:#9ca3af; font-size:13px;'>Seçtiğiniz hissenin geçmiş verileri üzerinde Pine Script state-machine algoritmasını bar-bar çalıştırır. Her bir Kusursuz Ret ve Trend Dip onayını kaydeder, izleyen stop (trailing stop) patladığında işlemi kapatarak kümülatif getiri raporu sunar.</div>
+            <div style='color:#9ca3af; font-size:13px;'>Seçtiğiniz hissenin geçmiş verileri üzerinde Pine Script algoritmasını bar-bar çalıştırır. Her bir Kusursuz Ret ve Trend Dip onayını kaydeder, ATR stop patladığında işlemi kapatarak kümülatif getiri raporu sunar.</div>
         </div>
     """, unsafe_allow_html=True)
 
@@ -378,24 +400,25 @@ with tab_backtest:
             
     with col_tf_bt: selected_tf_bt = st.selectbox("Zaman Periyodu:", list(TIMEFRAME_CONFIGS.keys()), key="tf_bt")
 
+    tf_config_bt = TIMEFRAME_CONFIGS[selected_tf_bt]
+    yf_ticker_bt = f"{target_symbol.replace('.', '-')}{mkt_config_bt['yf_suffix']}"
+    
+    # --- OTONOM TARİH MANTIRI ---
+    auto_first_date = get_first_available_date(yf_ticker_bt, tf_config_bt["interval"])
+
     col_start, col_end, col_btn_bt = st.columns([1, 1, 1])
-    with col_start: start_date = st.date_input("Başlangıç Tarihi", datetime.today() - timedelta(days=365*2))
-    with col_end: end_date = st.date_input("Bitiş Tarihi", datetime.today())
+    with col_start: start_date = st.date_input("Başlangıç Tarihi", value=auto_first_date)
+    with col_end: end_date = st.date_input("Bitiş Tarihi", value=datetime.today().date())
     with col_btn_bt: 
         st.write("##")
         run_backtest = st.button("ALGORİTMAYI TEST ET (BACKTEST)", use_container_width=True)
-        
-    st.markdown("<div style='font-size:11px; color:#6b7280;'>Not: Yahoo Finance API kısıtlamaları nedeniyle 1H, 2H ve 4H gibi saat içi periyotların geçmiş verisi en fazla son 730 gün (2 Yıl) ile sınırlıdır. Daha eski tarihler için Günlük (1D) periyot kullanınız.</div>", unsafe_allow_html=True)
 
     if run_backtest:
-        tf_config_bt = TIMEFRAME_CONFIGS[selected_tf_bt]
-        yf_ticker_bt = f"{target_symbol.replace('.', '-')}{mkt_config_bt['yf_suffix']}"
-        
-        with st.spinner(f"{target_symbol} için veriler indiriliyor ve simülasyon çalıştırılıyor..."):
+        with st.spinner(f"{target_symbol} için simülasyon çalıştırılıyor..."):
             df_bt = fetch_single_historical_data(yf_ticker_bt, tf_config_bt["interval"], start_date, end_date)
             
             if df_bt.empty:
-                st.error("Seçilen tarih aralığı veya periyot için veri bulunamadı. Lütfen saatlik grafikler için tarihi son 2 yıl içine çekin.")
+                st.error("Seçilen tarih aralığı veya periyot için veri bulunamadı.")
             else:
                 if isinstance(df_bt.columns, pd.MultiIndex):
                     df_bt.columns = df_bt.columns.get_level_values(0)
@@ -444,9 +467,8 @@ with tab_backtest:
                         st.pyplot(draw_equity_curve(trades_df))
                         
                         st.write("### 📝 Detaylı İşlem Dökümü (Trade Log)")
-                        
                         def highlight_pnl(val):
-                            color = '#10b981' if val > 0 else '#ef4444'
-                            return f'color: {color}; font-weight: bold;'
+                            return f"color: {'#10b981' if val > 0 else '#ef4444'}; font-weight: bold;"
                             
+                        st.dataframe(trades_df.style.map(highlight_pnl, subset=['Kâr/Zarar (%)']), use_container_width=True, hide_index=True)
                         st.dataframe(trades_df.style.map(highlight_pnl, subset=['Kâr/Zarar (%)']), use_container_width=True, hide_index=True)
