@@ -166,13 +166,16 @@ def core_pine_state_machine(df):
             if (lows[i] <= gTop) and (closes[i] > gTop) and (closes[i] > opens[i]) and not aRejected:
                 aRejected = True; evBullRej = True
                 
-        longEnter = evBullRej or isZigZagLow
-        longExit = (not np.isnan(trailing_stop)) and (closes[i] < trailing_stop)
+        # --- PINE SCRIPT BİREBİR GİRİŞ VE ÇIKIŞ (SAT) MANTIĞI ---
+        longEnter = (evBullRej or isZigZagLow) and activeValid and dirBull
+        
+        # Çıkış: Hem ATR Stop patlarsa, HEM DE Pine Script'teki gibi yeni bir "Tepe Onaylanırsa (isZigZagHigh)"
+        longExit = ((not np.isnan(trailing_stop)) and (closes[i] < trailing_stop)) or isZigZagHigh
         
         # --- İŞLEM YÖNETİMİ ---
         if in_position:
             if longExit:
-                in_position = False
+                in_position = False # Nakite Geç
                 exit_price = closes[i]
                 pnl_pct = ((exit_price - entry_price) / entry_price) * 100
                 trades.append({
@@ -182,16 +185,20 @@ def core_pine_state_machine(df):
                 trailing_stop = np.nan
         else:
             if longEnter:
-                in_position = True
+                in_position = True # Mal Alındı
                 entry_price, entry_date = closes[i], dates[i]
                 entry_type = "🎯 Kusursuz Ret" if evBullRej else "🔥 Trend/Dip Onayı"
                 
         # --- TARAYICI DURUMU ---
         if i >= N - 5: 
             current_bar_signal = None
-            if in_position and longEnter and i == N-1: current_bar_signal = "📈 Trend İçi Ekleme"
-            elif not in_position and longEnter: current_bar_signal = "🎯 Taze Alım (Kusursuz Ret)" if evBullRej else "🔥 Taze Alım (Trend/Dip Onayı)"
-            
+            if in_position and longEnter and i == N-1: 
+                current_bar_signal = "📈 Trend İçi Ekleme"
+            elif not in_position and longEnter: 
+                current_bar_signal = "🎯 Taze Alım (Kusursuz Ret)" if evBullRej else "🔥 Taze Alım (Trend/Dip Onayı)"
+            elif in_position and longExit and i == N-1:
+                current_bar_signal = "🛑 SAT Sinyali (Tepe Onayı / Stop)"
+                
             if current_bar_signal:
                 bars_ago = (N - 1) - i
                 ext = f" ({bars_ago} bar önce)" if bars_ago > 0 else ""
@@ -490,7 +497,6 @@ with tab_bulk:
                         
                     state, trades = core_pine_state_machine(df_symbol)
                     
-                    # Güncel Durum Saptaması
                     if state["signal"]:
                         guncel_durum = state["data"]["type"].split('(')[0].strip()
                     else:
@@ -528,6 +534,7 @@ with tab_bulk:
                     def style_status(val):
                         if "🎯" in val or "🔥" in val or "📈" in val: return "color: #10b981; font-weight: bold;"
                         elif "🟢" in val: return "color: #3b82f6;"
+                        elif "🛑" in val: return "color: #ef4444; font-weight: bold;"
                         elif "⏳" in val or "👀" in val: return "color: #f59e0b;"
                         else: return "color: #ef4444;"
                         
