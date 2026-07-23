@@ -169,13 +169,14 @@ def core_pine_state_machine(df):
         # --- PINE SCRIPT BİREBİR GİRİŞ VE ÇIKIŞ (SAT) MANTIĞI ---
         longEnter = (evBullRej or isZigZagLow) and activeValid and dirBull
         
-        # Çıkış: Hem ATR Stop patlarsa, HEM DE Pine Script'teki gibi yeni bir "Tepe Onaylanırsa (isZigZagHigh)"
-        longExit = ((not np.isnan(trailing_stop)) and (closes[i] < trailing_stop)) or isZigZagHigh
+        # DÜZELTME: Çıkış şartı ARTIK SADECE ATR İzleyen Stop'un kırılmasıdır.
+        # "isZigZagHigh" (Tepe Onayı) şartı kaldırıldı.
+        longExit = (not np.isnan(trailing_stop)) and (closes[i] < trailing_stop)
         
         # --- İŞLEM YÖNETİMİ ---
         if in_position:
             if longExit:
-                in_position = False # Nakite Geç
+                in_position = False # Stop patladı, Nakite Geç
                 exit_price = closes[i]
                 pnl_pct = ((exit_price - entry_price) / entry_price) * 100
                 trades.append({
@@ -197,7 +198,7 @@ def core_pine_state_machine(df):
             elif not in_position and longEnter: 
                 current_bar_signal = "🎯 Taze Alım (Kusursuz Ret)" if evBullRej else "🔥 Taze Alım (Trend/Dip Onayı)"
             elif in_position and longExit and i == N-1:
-                current_bar_signal = "🛑 SAT Sinyali (Tepe Onayı / Stop)"
+                current_bar_signal = "🛑 SAT Sinyali (Stop Patladı)"
                 
             if current_bar_signal:
                 bars_ago = (N - 1) - i
@@ -497,6 +498,7 @@ with tab_bulk:
                         
                     state, trades = core_pine_state_machine(df_symbol)
                     
+                    # Güncel Durum Saptaması
                     if state["signal"]:
                         guncel_durum = state["data"]["type"].split('(')[0].strip()
                     else:
