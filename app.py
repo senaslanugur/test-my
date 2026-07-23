@@ -70,11 +70,11 @@ def get_all_market_symbols(mkt_config):
 
 @st.cache_data(ttl=900, show_spinner=False) 
 def fetch_data_cached(tickers, period, interval):
-    return yf.download(tickers=tickers, period=period, interval=interval, group_by="ticker", threads=True, progress=False, show_errors=False)
+    return yf.download(tickers=tickers, period=period, interval=interval, group_by="ticker", threads=True, progress=False)
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_single_historical_data(ticker, interval, start_date, end_date):
-    return yf.download(ticker, start=start_date, end=end_date, interval=interval, progress=False, show_errors=False)
+    return yf.download(ticker, start=start_date, end=end_date, interval=interval, progress=False)
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_first_available_date(ticker, interval):
@@ -83,7 +83,7 @@ def get_first_available_date(ticker, interval):
         if interval == "1h":
             return datetime.today().date() - timedelta(days=725)
             
-        hist = yf.download(ticker, period="max", interval="1d", progress=False, show_errors=False)
+        hist = yf.download(ticker, period="max", interval="1d", progress=False)
         if not hist.empty:
             return hist.index.min().date()
     except Exception:
