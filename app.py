@@ -212,6 +212,9 @@ def core_pine_state_machine(df):
         elif 0 < dist_pct <= 0.025:
             latest_state = {"signal": True, "data": {"type": f"👀 Yaklaşıyor (+%{dist_pct*100:.1f})", "gz_lower": gBot, "gz_upper": gTop, "tp": aHigh + ((aHigh - aLow) * 0.618), "last_high": aHigh, "stop": trailing_stop if not np.isnan(trailing_stop) else aLow}}
 
+    # Portföydeki güncel durumu State'e kaydediyoruz
+    latest_state["in_position"] = in_position
+
     return latest_state, trades
 
 # =============================================================================
@@ -438,7 +441,7 @@ with tab_bulk:
     st.markdown("""
         <div style='background-color:#111827; padding:15px; border-left:4px solid #8b5cf6; margin-bottom:20px;'>
             <div style='color:#e5e7eb; font-weight:600; font-size:14px; margin-bottom:5px;'>Market-Wide Backtest (Tüm Piyasa Simülasyonu)</div>
-            <div style='color:#9ca3af; font-size:13px;'>Stratejinin seçilen periyotta ve piyasadaki tüm hisseler üzerindeki genel kazanma oranını ve performansını ölçer. Sadece sinyal verenleri değil, <b>stratejiye en uygun ve en sadık hisseleri</b> bulmanızı sağlar. Sütun başlıklarına tıklayarak sıralama yapabilirsiniz.</div>
+            <div style='color:#9ca3af; font-size:13px;'>Stratejinin seçilen periyotta ve piyasadaki tüm hisseler üzerindeki genel kazanma oranını ve performansını ölçer. Aynı zamanda her bir hissenin tam şu an hangi durumda olduğunu (Pozisyonda mı, Nakitte mi, Sinyal mi veriyor) gösterir.</div>
         </div>
     """, unsafe_allow_html=True)
 
@@ -485,8 +488,14 @@ with tab_bulk:
                         
                     if len(df_symbol) < 50: continue
                         
-                    _, trades = core_pine_state_machine(df_symbol)
+                    state, trades = core_pine_state_machine(df_symbol)
                     
+                    # Güncel Durum Saptaması
+                    if state["signal"]:
+                        guncel_durum = state["data"]["type"].split('(')[0].strip()
+                    else:
+                        guncel_durum = "🟢 Pozisyonda (Trend Devam)" if state.get("in_position") else "🔴 Nakitte (Fırsat Bekleniyor)"
+
                     if trades:
                         trades_df = pd.DataFrame(trades)
                         total = len(trades_df)
@@ -501,6 +510,7 @@ with tab_bulk:
                             
                         bulk_results.append({
                             "Hisse": symbol,
+                            "Güncel Durum": guncel_durum,
                             "Toplam İşlem": total,
                             "Kazanma Oranı (%)": round(win_rate, 2),
                             "Net Getiri (%)": round(net_return, 2),
@@ -513,11 +523,17 @@ with tab_bulk:
                     st.success(f"{len(bulk_results)} adet hissenin backtest işlemi tamamlandı.")
                     bulk_df = pd.DataFrame(bulk_results)
                     
-                    # Sıralamayı Net Getiri'ye göre azalan şekilde yap
                     bulk_df = bulk_df.sort_values(by="Net Getiri (%)", ascending=False)
                     
+                    def style_status(val):
+                        if "🎯" in val or "🔥" in val or "📈" in val: return "color: #10b981; font-weight: bold;"
+                        elif "🟢" in val: return "color: #3b82f6;"
+                        elif "⏳" in val or "👀" in val: return "color: #f59e0b;"
+                        else: return "color: #ef4444;"
+                        
                     st.dataframe(
-                        bulk_df.style.map(lambda x: f"color: {'#10b981' if x > 0 else '#ef4444'}; font-weight: bold;", subset=['Net Getiri (%)'])
+                        bulk_df.style.map(style_status, subset=['Güncel Durum'])
+                                     .map(lambda x: f"color: {'#10b981' if x > 0 else '#ef4444'}; font-weight: bold;", subset=['Net Getiri (%)'])
                                      .map(lambda x: f"color: {'#10b981' if x >= 60 else '#f59e0b' if x >= 40 else '#ef4444'};", subset=['Kazanma Oranı (%)']),
                         use_container_width=True, hide_index=True
                     )
