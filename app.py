@@ -236,6 +236,9 @@ def run_strategy(
     long_exit = np.zeros(n, dtype=bool)
     entry_from_gz = np.zeros(n, dtype=bool)
     entry_from_zz = np.zeros(n, dtype=bool)
+    addon_signal = np.zeros(n, dtype=bool)
+    addon_from_gz = np.zeros(n, dtype=bool)
+    addon_from_zz = np.zeros(n, dtype=bool)
     zone_top_arr = np.full(n, np.nan)
     zone_bot_arr = np.full(n, np.nan)
     zone_bull_arr = np.full(n, np.nan)
@@ -380,20 +383,40 @@ def run_strategy(
                 entry_from_zz[i] = (not evBullRej) and isZigZagLow
                 position = True
         else:
+            # Zaten pozisyondayken gelen yeni bir AL sinyali: Pine'daki pyramiding=1
+            # default'u nedeniyle pozisyon büyümez, ama bu bir "ekleme / ikinci alım"
+            # fırsatı olarak kullanıcıya ayrıca raporlanır.
+            if longEnterSig:
+                addon_signal[i] = True
+                addon_from_gz[i] = evBullRej
+                addon_from_zz[i] = (not evBullRej) and isZigZagLow
             if not np.isnan(trailing_stop) and close[i] < trailing_stop:
                 long_exit[i] = True
                 position = False
+
+    open_entry_idx = None
+    if position:
+        entry_positions = np.where(long_entry)[0]
+        if len(entry_positions):
+            open_entry_idx = int(entry_positions[-1])
 
     return {
         "long_entry": long_entry,
         "long_exit": long_exit,
         "entry_from_gz": entry_from_gz,
         "entry_from_zz": entry_from_zz,
+        "addon_signal": addon_signal,
+        "addon_from_gz": addon_from_gz,
+        "addon_from_zz": addon_from_zz,
         "zone_top": zone_top_arr,
         "zone_bot": zone_bot_arr,
         "zone_bull": zone_bull_arr,
         "final_position": position,
-        "final_zone": {"bull": aBull, "high": aHigh, "low": aLow, "set": aSet, "alive": aAlive},
+        "open_entry_idx": open_entry_idx,
+        "final_zone": {
+            "bull": aBull, "high": aHigh, "low": aLow,
+            "set": aSet, "alive": aAlive, "rejected": aRejected,
+        },
         "final_trailing_stop": trailing_stop,
         "atr": atr,
     }
@@ -476,6 +499,15 @@ with st.sidebar:
         "Sadece SAT sonrası gelen taze AL sinyallerini göster", value=True,
         help="İşaretliyken, geçmişinde en az bir çıkışı (SAT) olmayan ilk-al sinyalleri listelenmez.",
     )
+    recency_bars = st.slider(
+        "Sinyal Tazeliği (son kaç bar içinde tetiklendi?)", min_value=1, max_value=20, value=3,
+        help="AL / Ekleme sinyalinin 'taze' sayılması için son kaç barda oluşmuş olması gerektiği. "
+             "Sadece son bar aranırsa çok az/hiç sonuç çıkabilir; bu pencereyi genişletmek sonuç sayısını artırır.",
+    )
+    watch_atr_mult = st.slider(
+        "Yakın Takip Mesafesi (× ATR)", min_value=0.2, max_value=5.0, value=1.5, step=0.1,
+        help="Fiyatın Golden Zone'a bu ATR çarpanı kadar mesafede olması, hisseyi 'Yakın Takip' listesine sokar.",
+    )
 
     with st.expander("📐 Pine Script Strateji Parametreleri", expanded=False):
         pivot_len = st.number_input("Pivot Strength (left bars)", 2, 60, 15)
@@ -493,9 +525,27 @@ with st.sidebar:
 mkt_cfg = MARKET_CONFIGS[market_label]
 tf_cfg = TIMEFRAME_CONFIGS[tf_label]
 
-for key in ["scan_results", "scan_meta"]:
+for key, default in [
+    ("fresh_results", []), ("watch_results", []), ("addon_results", []), ("scan_meta", {}),
+]:
     if key not in st.session_state:
-        st.session_state[key] = [] if key == "scan_results" else {}
+        st.session_state[key] = default
+
+
+def _golden_bounds(fz, g_lower, g_upper):
+    if not fz["set"] or fz["high"] is None or fz["low"] is None:
+        return np.nan, np.nan
+    rng = fz["high"] - fz["low"]
+    if rng <= 0:
+        return np.nan, np.nan
+    gA = fz["high"] - g_lower * rng if fz["bull"] else fz["low"] + g_lower * rng
+    gB = fz["high"] - g_upper * rng if fz["bull"] else fz["low"] + g_upper * rng
+    return min(gA, gB), max(gA, gB)
+
+
+def _tv_url(mkt_cfg, tf_cfg, sym):
+    return f"https://www.tradingview.com/chart/?symbol={mkt_cfg['tv_prefix']}{sym}&interval={tf_cfg['tv_interval']}"
+
 
 # =============================================================================
 # 7. TARAMA ÇALIŞTIRMA
@@ -512,13 +562,12 @@ if run_scan:
         with st.spinner(f"{len(yf_tickers)} hisse için {tf_label} verisi indiriliyor..."):
             batch = fetch_batch(tuple(yf_tickers), tf_cfg["yf_interval"], tf_cfg["period"])
 
-        results = []
+        fresh_results, watch_results, addon_results = [], [], []
         progress = st.progress(0)
         status = st.empty()
-        stored_dfs = {}
-        stored_res = {}
-
+        stored_dfs, stored_res = {}, {}
         single_ticker = len(yf_tickers) == 1
+        processed_ok = 0
 
         for idx, (sym, yf_t) in enumerate(zip(symbols, yf_tickers)):
             progress.progress((idx + 1) / len(symbols))
@@ -551,115 +600,218 @@ if run_scan:
             except Exception:
                 continue
 
+            processed_ok += 1
             n = len(df)
             last_idx = n - 1
-            is_fresh_entry_now = bool(res["long_entry"][last_idx])
-            had_prior_exit = bool(np.any(res["long_exit"][: last_idx])) if last_idx > 0 else False
+            window_start = max(0, n - int(recency_bars))
+            price_now = float(df["close"].iloc[-1])
+            tv_url = _tv_url(mkt_cfg, tf_cfg, sym)
+            symbol_used = False
 
-            qualifies = is_fresh_entry_now and (had_prior_exit or not only_after_sell)
-
-            if qualifies:
-                sig_type = "🟡 Golden Zone Reddi" if res["entry_from_gz"][last_idx] else "🔵 ZigZag Dip Onayı"
-                tv_url = (
-                    f"https://www.tradingview.com/chart/?symbol={mkt_cfg['tv_prefix']}{sym}"
-                    f"&interval={tf_cfg['tv_interval']}"
-                )
-                fz = res["final_zone"]
-                gLow = gTop = np.nan
-                if fz["set"] and fz["high"] is not None:
-                    rng = fz["high"] - fz["low"]
-                    if rng > 0:
-                        gA = fz["high"] - golden_lower * rng if fz["bull"] else fz["low"] + golden_lower * rng
-                        gB = fz["high"] - golden_upper * rng if fz["bull"] else fz["low"] + golden_upper * rng
-                        gTop, gLow = max(gA, gB), min(gA, gB)
-
-                results.append(
-                    {
+            # --- 1) TAZE AL SİNYALİ (son N barda tetiklenen yeni giriş) ---
+            entry_hits = np.where(res["long_entry"][window_start:])[0]
+            if len(entry_hits):
+                entry_idx = window_start + int(entry_hits[-1])
+                had_prior_exit = bool(np.any(res["long_exit"][:entry_idx]))
+                if had_prior_exit or not only_after_sell:
+                    sig_type = "🟡 Golden Zone Reddi" if res["entry_from_gz"][entry_idx] else "🔵 ZigZag Dip Onayı"
+                    gLow, gTop = _golden_bounds(res["final_zone"], golden_lower, golden_upper)
+                    fresh_results.append({
                         "Hisse": sym,
                         "Sinyal Tipi": sig_type,
-                        "Güncel Fiyat": round(float(df["close"].iloc[-1]), 4),
+                        "Sinyal Bar (geriye dönük)": n - 1 - entry_idx,
+                        "Güncel Fiyat": round(price_now, 4),
                         "Golden Zone Alt": round(float(gLow), 4) if not np.isnan(gLow) else None,
                         "Golden Zone Üst": round(float(gTop), 4) if not np.isnan(gTop) else None,
                         "Trailing Stop": (
                             round(float(res["final_trailing_stop"]), 4)
-                            if not np.isnan(res["final_trailing_stop"])
-                            else None
+                            if not np.isnan(res["final_trailing_stop"]) else None
                         ),
                         "Önceki SAT Var mı": "Evet" if had_prior_exit else "Hayır (İlk Sinyal)",
                         "Bağlantı": tv_url,
-                    }
-                )
+                    })
+                    symbol_used = True
+
+            # --- 2) EKLEME / İKİNCİ ALIM NOKTASI (pozisyon açıkken gelen yeni sinyal) ---
+            addon_hits = np.where(res["addon_signal"][window_start:])[0]
+            if res["final_position"] and len(addon_hits):
+                addon_idx = window_start + int(addon_hits[-1])
+                sig_type = "🟡 Golden Zone Reddi" if res["addon_from_gz"][addon_idx] else "🔵 ZigZag Dip Onayı"
+                gLow, gTop = _golden_bounds(res["final_zone"], golden_lower, golden_upper)
+                open_idx = res.get("open_entry_idx")
+                open_price = round(float(df["close"].iloc[open_idx]), 4) if open_idx is not None else None
+                addon_results.append({
+                    "Hisse": sym,
+                    "Ekleme Sinyal Tipi": sig_type,
+                    "Sinyal Bar (geriye dönük)": n - 1 - addon_idx,
+                    "Güncel Fiyat": round(price_now, 4),
+                    "İlk Alım Fiyatı": open_price,
+                    "Golden Zone Alt": round(float(gLow), 4) if not np.isnan(gLow) else None,
+                    "Golden Zone Üst": round(float(gTop), 4) if not np.isnan(gTop) else None,
+                    "Trailing Stop": (
+                        round(float(res["final_trailing_stop"]), 4)
+                        if not np.isnan(res["final_trailing_stop"]) else None
+                    ),
+                    "Bağlantı": tv_url,
+                })
+                symbol_used = True
+
+            # --- 3) YAKIN TAKİP (Golden Zone'a yaklaşan / içinde onay bekleyen, henüz pozisyonsuz) ---
+            fz = res["final_zone"]
+            if (not res["final_position"]) and fz["set"] and fz["alive"] and fz["bull"] and not fz["rejected"]:
+                gLow, gTop = _golden_bounds(fz, golden_lower, golden_upper)
+                atr_last = res["atr"][last_idx]
+                if not np.isnan(gLow) and not np.isnan(atr_last):
+                    last_low = float(df["low"].iloc[-1])
+                    invalid_level = gLow - watch_atr_mult * atr_last
+                    if price_now >= invalid_level:
+                        if last_low <= gTop and price_now >= gLow - 0.15 * atr_last:
+                            status_txt = "🟠 Bölgede — Onay Bekleniyor"
+                        elif 0 < (price_now - gTop) <= watch_atr_mult * atr_last:
+                            status_txt = "👀 Yaklaşıyor"
+                        else:
+                            status_txt = None
+                        if status_txt:
+                            watch_results.append({
+                                "Hisse": sym,
+                                "Durum": status_txt,
+                                "Güncel Fiyat": round(price_now, 4),
+                                "Golden Zone Alt": round(float(gLow), 4),
+                                "Golden Zone Üst": round(float(gTop), 4),
+                                "Zone'a Uzaklık (ATR)": round((price_now - gTop) / atr_last, 2) if atr_last > 0 else None,
+                                "Bağlantı": tv_url,
+                            })
+                            symbol_used = True
+
+            if symbol_used:
                 stored_dfs[sym] = df
                 stored_res[sym] = res
 
         progress.empty()
         status.empty()
 
-        st.session_state.scan_results = results
+        st.session_state.fresh_results = fresh_results
+        st.session_state.watch_results = watch_results
+        st.session_state.addon_results = addon_results
         st.session_state.scan_meta = {
-            "dfs": stored_dfs,
-            "res": stored_res,
-            "tf_label": tf_label,
-            "market_label": market_label,
-            "scanned_count": len(symbols),
+            "dfs": stored_dfs, "res": stored_res, "tf_label": tf_label,
+            "market_label": market_label, "scanned_count": len(symbols), "processed_ok": processed_ok,
         }
 
-        if results:
-            st.success(f"Tarama tamamlandı: {len(symbols)} hisse tarandı, {len(results)} hisse TAM AL NOKTASI'nda.")
+        total_hits = len(fresh_results) + len(watch_results) + len(addon_results)
+        if total_hits:
+            st.success(
+                f"Tarama tamamlandı: {len(symbols)} hisse hedeflendi, {processed_ok} hisse başarıyla işlendi. "
+                f"AL: {len(fresh_results)}  |  Yakın Takip: {len(watch_results)}  |  Ekleme: {len(addon_results)}"
+            )
         else:
-            st.warning(f"Tarama tamamlandı: {len(symbols)} hisse tarandı, kriterlere uyan hisse bulunamadı.")
+            st.warning(
+                f"Tarama tamamlandı: {len(symbols)} hisse hedeflendi, {processed_ok} hisse başarıyla işlendi, "
+                "hiçbir kategoriye uyan hisse bulunamadı. 'Sinyal Tazeliği' penceresini genişletmeyi "
+                "veya taranacak hisse sayısını artırmayı deneyin."
+            )
+        if processed_ok == 0:
+            st.error(
+                "Hiçbir hisse verisi işlenemedi — yfinance/ağ erişiminde bir sorun olabilir "
+                "(sembol formatı, veri sağlayıcı kısıtı, ya da seçilen zaman diliminde yeterli geçmiş bulunmaması)."
+            )
 
 # =============================================================================
-# 8. SONUÇ TABLOSU VE GRAFİK İSTASYONU
+# 8. SONUÇ TABLOLARI VE GRAFİK İSTASYONU
 # =============================================================================
-results = st.session_state.scan_results
+fresh_results = st.session_state.fresh_results
+watch_results = st.session_state.watch_results
+addon_results = st.session_state.addon_results
 meta = st.session_state.scan_meta
 
-if results:
-    st.write("---")
-    st.subheader(f"🎯 TAM AL NOKTASINDAKİ HİSSELER — {meta.get('market_label','')} / {meta.get('tf_label','')}")
+any_results = fresh_results or watch_results or addon_results
 
-    res_df = pd.DataFrame(results)
-    st.dataframe(
-        res_df,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Güncel Fiyat": st.column_config.NumberColumn("Güncel Fiyat", format="%.4f"),
-            "Golden Zone Alt": st.column_config.NumberColumn("Golden Zone Alt", format="%.4f"),
-            "Golden Zone Üst": st.column_config.NumberColumn("Golden Zone Üst", format="%.4f"),
-            "Trailing Stop": st.column_config.NumberColumn("Trailing Stop", format="%.4f"),
-            "Bağlantı": st.column_config.LinkColumn("TradingView", display_text="📊 Grafiği Aç"),
-        },
-    )
+if any_results:
+    st.write("---")
+    st.subheader(f"{meta.get('market_label','')} / {meta.get('tf_label','')} — Tarama Sonuçları")
+
+    tab1, tab2, tab3 = st.tabs([
+        f"🎯 Taze AL Sinyalleri ({len(fresh_results)})",
+        f"👀 Yakın Takip ({len(watch_results)})",
+        f"➕ Ekleme / İkinci Alım Noktası ({len(addon_results)})",
+    ])
+
+    with tab1:
+        if fresh_results:
+            st.dataframe(
+                pd.DataFrame(fresh_results), use_container_width=True, hide_index=True,
+                column_config={
+                    "Güncel Fiyat": st.column_config.NumberColumn(format="%.4f"),
+                    "Golden Zone Alt": st.column_config.NumberColumn(format="%.4f"),
+                    "Golden Zone Üst": st.column_config.NumberColumn(format="%.4f"),
+                    "Trailing Stop": st.column_config.NumberColumn(format="%.4f"),
+                    "Bağlantı": st.column_config.LinkColumn("TradingView", display_text="📊 Grafiği Aç"),
+                },
+            )
+        else:
+            st.info("Bu kategoriye uyan hisse bulunamadı.")
+
+    with tab2:
+        st.caption("Golden Zone'a yaklaşan veya bölge içinde yeşil-mum onayı bekleyen, henüz pozisyona girilmemiş hisseler.")
+        if watch_results:
+            st.dataframe(
+                pd.DataFrame(watch_results), use_container_width=True, hide_index=True,
+                column_config={
+                    "Güncel Fiyat": st.column_config.NumberColumn(format="%.4f"),
+                    "Golden Zone Alt": st.column_config.NumberColumn(format="%.4f"),
+                    "Golden Zone Üst": st.column_config.NumberColumn(format="%.4f"),
+                    "Bağlantı": st.column_config.LinkColumn("TradingView", display_text="📊 Grafiği Aç"),
+                },
+            )
+        else:
+            st.info("Bu kategoriye uyan hisse bulunamadı.")
+
+    with tab3:
+        st.caption("Zaten pozisyonda olup, Pine'ın pyramiding kısıtı nedeniyle otomatik büyümeyen ama yeni bir AL/HL sinyali üretmiş — manuel ekleme fırsatı olabilecek hisseler.")
+        if addon_results:
+            st.dataframe(
+                pd.DataFrame(addon_results), use_container_width=True, hide_index=True,
+                column_config={
+                    "Güncel Fiyat": st.column_config.NumberColumn(format="%.4f"),
+                    "İlk Alım Fiyatı": st.column_config.NumberColumn(format="%.4f"),
+                    "Golden Zone Alt": st.column_config.NumberColumn(format="%.4f"),
+                    "Golden Zone Üst": st.column_config.NumberColumn(format="%.4f"),
+                    "Trailing Stop": st.column_config.NumberColumn(format="%.4f"),
+                    "Bağlantı": st.column_config.LinkColumn("TradingView", display_text="📊 Grafiği Aç"),
+                },
+            )
+        else:
+            st.info("Bu kategoriye uyan hisse bulunamadı.")
 
     st.write("---")
     st.subheader("🔬 Grafik İnceleme İstasyonu")
     symbols_available = list(meta["dfs"].keys())
-    selected = st.selectbox("İncelemek için hisse seçin:", symbols_available)
+    if symbols_available:
+        selected = st.selectbox("İncelemek için hisse seçin:", symbols_available)
+        if selected:
+            col_chart, col_info = st.columns([4, 1])
+            df_sel = meta["dfs"][selected]
+            res_sel = meta["res"][selected]
 
-    if selected:
-        col_chart, col_info = st.columns([4, 1])
-        df_sel = meta["dfs"][selected]
-        res_sel = meta["res"][selected]
+            with col_chart:
+                st.plotly_chart(build_chart(df_sel, res_sel, selected, meta["tf_label"]), use_container_width=True)
 
-        with col_chart:
-            st.plotly_chart(build_chart(df_sel, res_sel, selected, meta["tf_label"]), use_container_width=True)
-
-        with col_info:
-            row = next(r for r in results if r["Hisse"] == selected)
-            st.metric("Güncel Fiyat", row["Güncel Fiyat"])
-            if row["Golden Zone Alt"] is not None:
-                st.metric("Golden Zone", f"{row['Golden Zone Alt']} — {row['Golden Zone Üst']}")
-            if row["Trailing Stop"] is not None:
-                st.metric("Trailing Stop", row["Trailing Stop"])
-            st.write(row["Sinyal Tipi"])
-            st.link_button("📊 TradingView'de Aç", row["Bağlantı"])
+            with col_info:
+                st.metric("Güncel Fiyat", round(float(df_sel["close"].iloc[-1]), 4))
+                gLow, gTop = _golden_bounds(res_sel["final_zone"], golden_lower, golden_upper)
+                if not np.isnan(gLow):
+                    st.metric("Golden Zone", f"{round(float(gLow),4)} — {round(float(gTop),4)}")
+                ts = res_sel.get("final_trailing_stop", np.nan)
+                if not np.isnan(ts):
+                    st.metric("Trailing Stop", round(float(ts), 4))
+                st.write("Pozisyon: " + ("🟢 Açık (Long)" if res_sel["final_position"] else "⚪ Flat"))
+                tv_link = _tv_url(mkt_cfg, tf_cfg, selected)
+                st.link_button("📊 TradingView'de Aç", tv_link)
 else:
     st.info(
         "Sol menüden piyasa, zaman dilimi ve strateji parametrelerini seçip **TARAMAYI BAŞLAT** butonuna basın. "
-        "Strateji, Pine Script'teki Fibonacci Golden Zone AL/SAT mantığını birebir uygulayarak, sat işleminden "
-        "sonra tam alım noktasında olan hisseleri listeler."
+        "Strateji üç ayrı liste üretir: (1) taze AL sinyali verenler, (2) Golden Zone'a yaklaşan/içinde bekleyen "
+        "izleme listesi, (3) zaten pozisyondayken yeni bir AL sinyali almış (ekleme/ikinci alım) hisseler."
     )
 
 st.write("---")
